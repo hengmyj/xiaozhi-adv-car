@@ -6,10 +6,22 @@
 
 - 基于 `m5stack-cardputer-adv` 拷贝，独立 OTA 名称，可与官方固件并存升级
 - **Fn+1** 聊天页、**Fn+2** 麦轮小车、**Fn+3** 蜘蛛（EMQX `car/cmd` + `foc/cmd`，独立于小智云 MQTT）
-- 车控页：**;** 前进、**.** 停止、**,** 左转、**/``** 右转（无需按 Fn；Fn 仅用于 Fn+1/2/3 切页）
+- 车控页：**;** 前进、**.** 停止、**,** 左转、**/** 右转（无需按 Fn；Fn 仅用于 Fn+1/2/3 切页）
 - Broker：`broker-cn.emqx.io:1883`，订阅 `car/state` 显示运行状态
 - **Fn** 为键盘左下独立键（row2 col0，`KEY_MOD_FN`），**不是** Opt 键；需按住 Fn 再按数字
 - 切页使用 `lv_obj HIDDEN` 隐藏聊天 UI，不销毁 LVGL 树
+
+## MQTT 车控
+
+本板通过独立 EMQX 通道控制麦轮 / 蜘蛛（与小智云 MQTT 无关）：
+
+| Topic | 作用 |
+|-------|------|
+| `car/cmd` | `{"run":0\|1,"speed":0-100}`（无 `dir`） |
+| `foc/cmd` | 转向 `{"dir":1\|-1,"speed":…}`（`1` 左 / `-1` 右） |
+| `car/state` | 反馈 `{"run","speed","pwm"}`（本板订阅） |
+
+完整协议、架构图与网页仪表盘映射见项目文档：**[docs/car-mqtt-control.md](../../../docs/car-mqtt-control.md)**。
 
 ## 硬件
 

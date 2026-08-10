@@ -126,6 +126,21 @@ v1 的稳定版本为 1.9.2，可以通过 `git checkout v1` 来切换到 v1 版
 - [MCP 协议交互流程](docs/mcp-protocol_zh.md) - 设备端 MCP 协议的实现方式
 - [MQTT + UDP 混合通信协议文档](docs/mqtt-udp_zh.md)
 - [一份详细的 WebSocket 通信协议文档](docs/websocket_zh.md)
+- [ESP32 小车 MQTT 控制协议](docs/car-mqtt-control.md) - Cardputer ADV 车控 fork 与麦轮/蜘蛛的 EMQX 协议（独立于小智云）
+
+## xiaozhi-ADV-car Fork
+
+本仓库为 M5Stack Cardputer ADV 多页车控 fork，OTA 板名 `m5stack-cardputer-adv-car`。
+
+### MQTT 车控（摘要）
+
+![Cardputer ADV 控车](docs/images/cardputer-adv-car-control.png)
+
+- Broker：`broker-cn.emqx.io:1883`（浏览器可用 WS `8083` / WSS `8084`）
+- `car/cmd`：`{"run":0|1,"speed":0-100}`；`foc/cmd`：转向 `dir` `1`/`-1`；可选订阅 `car/state`
+- 按键：Fn+1 聊天 / Fn+2 麦轮 / Fn+3 蜘蛛；车控页 `;` `.` `,` `/` 前进/停/左/右
+
+详见 [docs/car-mqtt-control.md](docs/car-mqtt-control.md) 与 [板型 README](main/boards/m5stack-cardputer-adv-car/README_zh.md)。
 
 ## 大模型配置
 
