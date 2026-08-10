@@ -2,6 +2,7 @@
 #include "wifi_config_ui.h"
 #include "codecs/es8311_audio_codec.h"
 #include "cardputer_adv_lcd_display.h"
+#include "emqx_mqtt_client.h"
 #include "page_manager.h"
 #include "application.h"
 #include "button.h"
@@ -10,6 +11,7 @@
 #include "tca8418_keyboard.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <driver/i2c_master.h>
 #include <driver/i2s_common.h>
 #include <driver/spi_common.h>
@@ -36,7 +38,27 @@ private:
     Tca8418Keyboard* keyboard_ = nullptr;
     std::unique_ptr<WifiConfigUI> wifi_config_ui_;
     PageManager page_manager_;
+    EmqxCarMqtt emqx_mqtt_;
+    esp_timer_handle_t car_timer_ = nullptr;
     bool wifi_config_mode_ = false;
+
+    static void OnCarTimer(void* arg) {
+        auto* board = static_cast<M5StackCardputerAdvCarBoard*>(arg);
+        board->emqx_mqtt_.Tick();
+        board->page_manager_.Tick();
+    }
+
+    void InitializeCarTimer() {
+        esp_timer_create_args_t args = {
+            .callback = OnCarTimer,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "car_mqtt_tick",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&args, &car_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(car_timer_, 200000));
+    }
 
     void InitializeI2c() {
         ESP_LOGI(TAG, "Initialize I2C bus");
@@ -120,7 +142,9 @@ private:
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
         display_->SetSetupUiCallback([this]() {
-            page_manager_.Initialize(display_);
+            emqx_mqtt_.Initialize(GetNetwork());
+            page_manager_.Initialize(display_, &emqx_mqtt_);
+            InitializeCarTimer();
         });
     }
 
@@ -162,11 +186,22 @@ private:
             page_manager_.ShowPage(PageId::Car);
             return true;
         }
+        if (event.key_code == KC_3) {
+            page_manager_.ShowPage(PageId::Spider);
+            return true;
+        }
         return false;
     }
 
     void HandleKeyEvent(const KeyEvent& event) {
         if (HandlePageSwitchKey(event)) {
+            return;
+        }
+
+        if (page_manager_.IsVehiclePage()) {
+            if (page_manager_.HandleVehicleKey(event)) {
+                return;
+            }
             return;
         }
 
@@ -196,6 +231,11 @@ private:
 
     void HandleLegacyKeyPress(LegacyKeyCode key) {
         if (wifi_config_mode_) {
+            return;
+        }
+
+        if (page_manager_.IsVehiclePage()) {
+            page_manager_.HandleVehicleLegacyKey(key);
             return;
         }
 
