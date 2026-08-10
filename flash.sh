@@ -1,0 +1,75 @@
+#!/bin/bash
+# flash.sh — 编译 + 烧录 M5Stack Cardputer ADV Car（ESP-IDF，不自动开监视器）
+#
+# ESP-IDF：项目要求 >= 5.4（见 README_zh.md）。推荐本机：
+#   export IDF_PATH=~/.espressif/v5.5.3/esp-idf
+#   首次缺 Python 环境：$IDF_PATH/tools/idf_tools.py install-python-env
+# 勿将 IDF_PATH 指到 ~/Documents/esp/esp-idf（v5.0-dev，idf5.0_py3.12_env 不存在会报错）。
+#
+# 用法：
+#   ./flash.sh
+#   PORT=/dev/cu.usbmodem101 ./flash.sh
+#   BAUD=115200 ./flash.sh
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+IDF_PATH="${IDF_PATH:-$HOME/.espressif/v5.5.3/esp-idf}"
+if [ ! -f "$IDF_PATH/export.sh" ]; then
+  echo "[ERROR] 找不到 export.sh，请设置 IDF_PATH（当前: $IDF_PATH）"
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$IDF_PATH/export.sh"
+
+BOARD_TYPE="m5stack-cardputer-adv-car"
+BOARD_NAME="m5stack-cardputer-adv-car"
+PORT="${PORT:-}"
+BAUD="${BAUD:-460800}"
+
+detect_port() {
+  for p in /dev/cu.usbmodem* /dev/cu.wchusb* /dev/cu.usbserial* /dev/cu.SLAB*; do
+    [ -e "$p" ] && echo "$p" && return 0
+  done
+  return 1
+}
+
+ensure_board_sdkconfig() {
+  if ! grep -q "CONFIG_BOARD_TYPE_M5STACK_CARDPUTER_ADV_CAR=y" sdkconfig 2>/dev/null; then
+    echo "[INFO] 首次配置板型：esp32s3 / 8MB Flash / 无 PSRAM"
+    idf.py set-target esp32s3
+    {
+      echo ""
+      echo "# Append by flash.sh"
+      echo "CONFIG_BOARD_TYPE_M5STACK_CARDPUTER_ADV_CAR=y"
+      echo "CONFIG_SPIRAM=n"
+      echo "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y"
+      echo 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/8m.csv"'
+    } >> sdkconfig
+  fi
+}
+
+if [ -z "$PORT" ]; then
+  PORT="$(detect_port || true)"
+fi
+
+echo "╔══════════════════════════════════════╗"
+echo "║  编译 + 烧录 Cardputer ADV Car        ║"
+echo "║  ESP-IDF / $BOARD_NAME"
+echo "╚══════════════════════════════════════╝"
+echo "IDF: $(idf.py --version 2>/dev/null | head -1)"
+[ -n "$PORT" ] && echo "串口: $PORT" || echo "[WARN] 未检测到 USB 串口；可 PORT=/dev/cu.usbmodemXXX ./flash.sh"
+echo "upload baud: $BAUD（慢速: BAUD=115200 ./flash.sh）"
+echo "烧录后串口: ./monitor.sh"
+echo ""
+
+ensure_board_sdkconfig
+
+SECONDS=0
+idf.py -DBOARD_NAME="$BOARD_NAME" -DBOARD_TYPE="$BOARD_TYPE" build
+if [ -n "$PORT" ]; then
+  idf.py -p "$PORT" -b "$BAUD" flash
+else
+  idf.py -b "$BAUD" flash
+fi
+echo "[OK] 烧录完成 (${SECONDS}s)"
