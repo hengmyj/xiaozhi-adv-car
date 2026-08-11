@@ -817,6 +817,13 @@ if(MANUFACTURER)
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/${MANUFACTURER}/${BOARD_TYPE}/*.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/${MANUFACTURER}/${BOARD_TYPE}/*.c
     )
+elseif(BOARD_TYPE STREQUAL "m5stack-cardputer-adv-car")
+    # Board sources live in root + common/ + pages/<feature>/ (not ir/, which is listed below)
+    file(GLOB BOARD_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/common/*.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/pages/*/*.cc
+    )
 else()
     file(GLOB BOARD_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.cc
@@ -984,6 +991,29 @@ if(CONFIG_BOARD_TYPE_ESP_VOCAT)
         espressif__touch_button_sensor
     )
 endif()
+if(BOARD_TYPE STREQUAL "m5stack-cardputer-adv-car")
+    # Board-local IR stack (colocate under m5stack-cardputer-adv-car/ir/)
+    set(BOARD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/boards/m5stack-cardputer-adv-car")
+    set(BOARD_IR_DIR "${BOARD_DIR}/ir")
+    set(IRREMOTE_SRC_DIR "${BOARD_IR_DIR}/IRremoteESP8266/src")
+    list(APPEND SOURCES
+        ${BOARD_IR_DIR}/mitsubishi_ir.cc
+        ${BOARD_IR_DIR}/ir_utils_stub.cpp
+        ${IRREMOTE_SRC_DIR}/IRsend.cpp
+        ${IRREMOTE_SRC_DIR}/IRtimer.cpp
+        ${IRREMOTE_SRC_DIR}/ir_Mitsubishi.cpp
+        ${BOARD_IR_DIR}/arduino_shim/arduino_shim.cpp
+    )
+    file(GLOB BOARD_PAGE_INCLUDE_DIRS "${BOARD_DIR}/pages/*")
+    list(APPEND INCLUDE_DIRS
+        ${BOARD_DIR}
+        ${BOARD_DIR}/common
+        ${BOARD_PAGE_INCLUDE_DIRS}
+        ${BOARD_IR_DIR}
+        ${IRREMOTE_SRC_DIR}
+        ${BOARD_IR_DIR}/arduino_shim/include
+    )
+endif()
 
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
@@ -1007,6 +1037,7 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp_http_client
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
@@ -1019,6 +1050,25 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     )
+
+if(BOARD_TYPE STREQUAL "m5stack-cardputer-adv-car")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        ARDUINO=1
+        _IR_ENABLE_DEFAULT_=false
+        SEND_MITSUBISHI_AC=true
+        DECODE_MITSUBISHI_AC=false
+        SEND_MITSUBISHI=false
+        DECODE_MITSUBISHI=false
+        SEND_MITSUBISHI2=false
+        DECODE_MITSUBISHI2=false
+        SEND_MITSUBISHI112=false
+        DECODE_MITSUBISHI112=false
+        SEND_MITSUBISHI136=false
+        DECODE_MITSUBISHI136=false
+        SEND_MITSUBISHIHEAVY=false
+        DECODE_MITSUBISHIHEAVY=false
+    )
+endif()
 
 target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=printf")
 

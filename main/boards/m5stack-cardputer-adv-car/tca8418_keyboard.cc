@@ -182,8 +182,8 @@ void Tca8418Keyboard::Initialize() {
     gpio_install_isr_service(0);
     gpio_isr_handler_add(int_pin_, GpioIsrHandler, this);
 
-    // Create keyboard task
-    xTaskCreate(KeyboardTask, "keyboard_task", 4096, this, 5, &task_handle_);
+    // Larger stack: page key callbacks may touch LVGL under DisplayLockGuard.
+    xTaskCreate(KeyboardTask, "keyboard_task", 8192, this, 5, &task_handle_);
 
     ESP_LOGI(TAG, "TCA8418 keyboard initialized");
 }

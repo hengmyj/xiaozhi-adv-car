@@ -134,6 +134,10 @@ public:
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
+    // Direct codec playback (e.g. Radio HLS): hold ES8311 TX so power-save cannot mute.
+    void SetExternalPlaybackActive(bool active);
+    void NotifyOutputActivity();
+
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
@@ -179,6 +183,7 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    bool external_playback_active_ = false;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;

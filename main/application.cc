@@ -1119,6 +1119,69 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 #endif
 }
 
+void Application::RestoreAudioRouting() {
+    // Drop any exclusive hold (Radio HLS direct OutputData) so power-save + TTS
+    // can manage ES8311 again.
+    audio_service_.SetExternalPlaybackActive(false);
+
+    DeviceState state = GetDeviceState();
+    switch (state) {
+        case kDeviceStateStarting:
+        case kDeviceStateActivating:
+        case kDeviceStateUpgrading:
+        case kDeviceStateFatalError:
+        case kDeviceStateConnecting:
+            // Not ready / transitional — only clear exclusive hold.
+            break;
+        case kDeviceStateUnknown:
+        case kDeviceStateIdle:
+            audio_service_.EnableVoiceProcessing(false);
+            audio_service_.EnableWakeWordDetection(true);
+            break;
+        case kDeviceStateListening:
+            if (!audio_service_.IsAudioProcessorRunning()) {
+                audio_service_.EnableVoiceProcessing(true);
+            }
+#ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
+            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#else
+            audio_service_.EnableWakeWordDetection(false);
+#endif
+            break;
+        case kDeviceStateSpeaking:
+            if (listening_mode_ != kListeningModeRealtime) {
+                audio_service_.EnableVoiceProcessing(false);
+                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+            }
+            // Do not ResetDecoder here — would kill in-flight TTS.
+            break;
+        case kDeviceStateWifiConfiguring:
+        case kDeviceStateAudioTesting:
+            audio_service_.EnableVoiceProcessing(false);
+            audio_service_.EnableWakeWordDetection(false);
+            break;
+        default:
+            break;
+    }
+
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec != nullptr) {
+        int vol = codec->output_volume();
+        if (vol <= 0) {
+            codec->SetOutputVolume(70);
+            vol = 70;
+        }
+        ESP_LOGI(TAG,
+                 "RestoreAudioRouting state=%d vol=%d out=%d in=%d ww=%d vp=%d",
+                 static_cast<int>(state), vol, codec->output_enabled() ? 1 : 0,
+                 codec->input_enabled() ? 1 : 0,
+                 audio_service_.IsWakeWordRunning() ? 1 : 0,
+                 audio_service_.IsAudioProcessorRunning() ? 1 : 0);
+    } else {
+        ESP_LOGW(TAG, "RestoreAudioRouting state=%d (no codec)", static_cast<int>(state));
+    }
+}
+
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
     clock_ticks_ = 0;

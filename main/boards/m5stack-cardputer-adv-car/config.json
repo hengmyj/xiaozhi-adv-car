@@ -6,7 +6,22 @@
             "sdkconfig_append": [
                 "CONFIG_SPIRAM=n",
                 "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y",
-                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/8m.csv\""
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/8m_adv_car.csv\"",
+                "CONFIG_AUDIO_DECODER_MP3_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_G711_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_AMRNB_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_AMRWB_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_FLAC_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_VORBIS_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_ADPCM_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_ALAC_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_PCM_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_SBC_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_LC3_SUPPORT=n",
+                "CONFIG_AUDIO_DECODER_AAC_SUPPORT=y",
+                "CONFIG_AUDIO_SIMPLE_DEC_WAV_SUPPORT=n",
+                "CONFIG_AUDIO_SIMPLE_DEC_M4A_SUPPORT=n",
+                "CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT=y"
             ]
         }
     ]

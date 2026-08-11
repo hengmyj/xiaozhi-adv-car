@@ -679,12 +679,40 @@ void AudioService::ResetDecoder() {
     audio_queue_cv_.notify_all();
 }
 
+void AudioService::SetExternalPlaybackActive(bool active) {
+    external_playback_active_ = active;
+    if (active) {
+        last_output_time_ = std::chrono::steady_clock::now();
+        if (codec_ != nullptr) {
+            esp_timer_stop(audio_power_timer_);
+            esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+            if (!codec_->output_enabled()) {
+                codec_->EnableOutput(true);
+            }
+        }
+        ESP_LOGI(TAG, "external playback hold ON");
+    } else {
+        ESP_LOGI(TAG, "external playback hold OFF");
+    }
+}
+
+void AudioService::NotifyOutputActivity() {
+    last_output_time_ = std::chrono::steady_clock::now();
+}
+
 void AudioService::CheckAndUpdateAudioPowerState() {
     auto now = std::chrono::steady_clock::now();
     auto input_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
     auto output_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
     if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled()) {
         codec_->EnableInput(false);
+    }
+    // Radio / other direct OutputData paths: never power-gate TX while held.
+    if (external_playback_active_) {
+        if (codec_ != nullptr && !codec_->output_enabled()) {
+            codec_->EnableOutput(true);
+        }
+        return;
     }
     if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
         // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.

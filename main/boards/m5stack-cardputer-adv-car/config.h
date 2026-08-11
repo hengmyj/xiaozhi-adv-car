@@ -56,4 +56,7 @@
 // IMU BMI270 I2C address
 #define IMU_BMI270_ADDR 0x68
 
+// On-board IR emitter (Cardputer ADV, same as Sparks firmware GPIO 44)
+#define IR_TX_GPIO GPIO_NUM_44
+
 #endif // _BOARD_CONFIG_H_

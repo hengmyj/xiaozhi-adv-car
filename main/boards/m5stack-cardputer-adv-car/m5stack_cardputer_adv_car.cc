@@ -57,7 +57,8 @@ private:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&args, &car_timer_));
-        ESP_ERROR_CHECK(esp_timer_start_periodic(car_timer_, 200000));
+        // 100ms: smoother Matrix/Music/Radio animation; MQTT tick stays cheap.
+        ESP_ERROR_CHECK(esp_timer_start_periodic(car_timer_, 100000));
     }
 
     void InitializeI2c() {
@@ -178,19 +179,36 @@ private:
             return false;
         }
 
+        PageId target = PageId::Chat;
+        bool matched = false;
         if (event.key_code == KC_1) {
-            page_manager_.ShowPage(PageId::Chat);
-            return true;
+            target = PageId::Chat;
+            matched = true;
+        } else if (event.key_code == KC_2) {
+            target = PageId::Car;
+            matched = true;
+        } else if (event.key_code == KC_3) {
+            target = PageId::Spider;
+            matched = true;
+        } else if (event.key_code == KC_4) {
+            target = PageId::MjAc;
+            matched = true;
+        } else if (event.key_code == KC_5) {
+            target = PageId::Launcher;
+            matched = true;
         }
-        if (event.key_code == KC_2) {
-            page_manager_.ShowPage(PageId::Car);
-            return true;
+        if (!matched) {
+            return false;
         }
-        if (event.key_code == KC_3) {
-            page_manager_.ShowPage(PageId::Spider);
-            return true;
-        }
-        return false;
+
+        // Defer ShowPage off the keyboard task: OnEnter does LVGL + IR init.
+        // Keeping the keyboard task free avoids missed key events / stack pressure.
+        ESP_LOGI(TAG, "Fn+%d → schedule ShowPage %d",
+                 static_cast<int>(event.key_code - KC_1 + 1), static_cast<int>(target));
+        Application::GetInstance().Schedule([this, target]() {
+            page_manager_.ShowPage(target);
+        });
+        return true;
     }
 
     void HandleKeyEvent(const KeyEvent& event) {
@@ -198,10 +216,16 @@ private:
             return;
         }
 
-        if (page_manager_.IsVehiclePage()) {
-            if (page_manager_.HandleVehicleKey(event)) {
-                return;
+        // Non-chat pages own ALL non-Fn keys while active (including before
+        // wifi-config UI). Do not let wifi_config_mode_ steal digits / P/M/F.
+        if (page_manager_.IsExclusivePage()) {
+            if (event.pressed && !event.is_modifier) {
+                ESP_LOGI(TAG, "page=%d key=0x%02X char=%s fn=%d",
+                         static_cast<int>(page_manager_.current_page()), event.key_code,
+                         event.key_char ? event.key_char : "",
+                         keyboard_->IsFnPressed() ? 1 : 0);
             }
+            page_manager_.HandleVehicleKey(event);
             return;
         }
 

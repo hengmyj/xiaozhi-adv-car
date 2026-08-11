@@ -44,9 +44,37 @@ ensure_board_sdkconfig() {
       echo "CONFIG_BOARD_TYPE_M5STACK_CARDPUTER_ADV_CAR=y"
       echo "CONFIG_SPIRAM=n"
       echo "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y"
-      echo 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/8m.csv"'
+      echo 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/8m_adv_car.csv"'
     } >> sdkconfig
   fi
+  # Keep partition + slim audio codecs in sync (radio needs AAC/TS only).
+  if ! grep -q 'partitions/v2/8m_adv_car.csv' sdkconfig 2>/dev/null; then
+    echo 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/8m_adv_car.csv"' >> sdkconfig
+  fi
+  for kv in \
+    'CONFIG_AUDIO_DECODER_MP3_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_G711_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_AMRNB_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_AMRWB_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_FLAC_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_VORBIS_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_ADPCM_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_ALAC_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_PCM_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_SBC_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_LC3_SUPPORT=n' \
+    'CONFIG_AUDIO_DECODER_AAC_SUPPORT=y' \
+    'CONFIG_AUDIO_SIMPLE_DEC_WAV_SUPPORT=n' \
+    'CONFIG_AUDIO_SIMPLE_DEC_M4A_SUPPORT=n' \
+    'CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT=y'
+  do
+    key="${kv%%=*}"
+    if grep -q "^${key}=" sdkconfig 2>/dev/null; then
+      sed -i.bak "s|^${key}=.*|${kv}|" sdkconfig && rm -f sdkconfig.bak
+    else
+      echo "$kv" >> sdkconfig
+    fi
+  done
 }
 
 if [ -z "$PORT" ]; then

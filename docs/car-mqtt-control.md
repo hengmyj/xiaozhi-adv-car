@@ -6,7 +6,7 @@
 
 - 工作区总览：`~/Documents/esp/mqtt_io.md`
 - 麦轮设备端：`~/Documents/esp/car/esp32/io.md`、`car/esp32/dashborad.html`
-- 本板配置：`main/boards/m5stack-cardputer-adv-car/emqx_config.h`、车控页按键映射
+- 本板配置：`main/boards/m5stack-cardputer-adv-car/common/emqx_config.h`、车控页按键映射
 
 ---
 

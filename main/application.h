@@ -114,6 +114,12 @@ public:
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
     bool ShouldSuppressPendingChassisCommand(const std::string& serial_command) const;
+
+    /**
+     * Re-apply wake-word / voice-processing / speaker routing for the current
+     * device state. Call after exclusive pages (Radio/Music) release the codec.
+     */
+    void RestoreAudioRouting();
     
     /**
      * Reset protocol resources (thread-safe)
