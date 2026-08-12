@@ -1,0 +1,28 @@
+# xiaozhi-ADV-car
+
+Cardputer ADV 小智 fork + 多页启动器。
+
+**文档索引**：[docs/README.md](docs/README.md)
+
+## Learned User Preferences
+
+- 启动器/机载 UI 在 CJK 会乱码处用 ASCII 标签（如 Car / SpiderBot / IceBox）
+- Cardputer ADV 页面：Fn 仅用于切页；页内车控/IR 键无需 Fn；红外按键即时发码（无需 Enter）
+- Cardputer 已有键盘：配网优先机上扫列表+输密码，勿默认依赖 SoftAP/手机网页配网
+- `./flash.sh` + `./monitor.sh`（Radio 改 8m 分区表需整包烧录）；卡住监视器用 `./monitor.sh kill` 或 Ctrl+]
+- 不宜 ESP-Brookesia；构建 ESP-IDF ≥5.4（`~/.espressif/v5.5.3/esp-idf`）
+
+## Learned Workspace Facts
+
+- 硬件：Cardputer ADV（S3FN8、8MB、无 PSRAM）；板型/OTA `m5stack-cardputer-adv-car`
+- 页面与按键：[docs/architecture/pages-and-keys.md](docs/architecture/pages-and-keys.md)；MQTT：[docs/mqtt/car-mqtt-control.md](docs/mqtt/car-mqtt-control.md)
+- 键盘配网：`wifi_config_ui` 用 overlay，禁止 `lv_obj_clean(lv_scr_act())`；W/S 等重操作经 `Application::Schedule` 到主任务，否则易重启
+- Radio：OnEnter 勿阻塞；流媒体异步 + `CaptureAudioExclusive`/`RestoreAudioRouting`；无 PSRAM 下 HLS/AAC/TLS 过重，只走 HTTP MP3 低码率。详见 [docs/audio/radio.md](docs/audio/radio.md)
+- 音频内存（无 PSRAM）：进 Radio 仅剩 27KB → MP3 解码器 `MEM_LACK`；`AudioService` 常驻 Opus 占 43KB，`ReleaseAudioModels()` 后回到 70KB。本板 `CONFIG_WAKE_WORD_DISABLED=y` 无 AFE，释放唤醒词模型无效
+- `esp_audio_simple_dec_open()` 惰性：只占 148B 即返回成功，真解码器等第一帧才分配——「open 成功」≠ 能解码
+- Radio 流任务必须 **core 0 / prio 3**（`taskLVGL` 在 core1/prio1，抢了就触发 `task_wdt: CPU 1: taskLVGL`）
+- `cyberwisk/M5Cardputer_WebRadio` 不可照搬：原版 Cardputer 有 8MB PSRAM，其 HTTPS+128kbps 在 ADV 上跑不起来
+- 拿不到解码器格式信息时宁可静音；把未解码 MP3 字节当 PCM 播就是滋啦噪音来源
+- 勿设 `CONFIG_ESP_CONSOLE_NONE=y`：panic 无处输出，重启循环看不到 backtrace
+- 串口出现 `Device not configured` / reconnect 等待：USB CDC 常已断开，需拔插并确认 `/dev/cu.usbmodem*`；macOS Cmd+C 不会停 idf_monitor
+- 远程仓库：`https://github.com/hengmyj/xiaozhi-adv-car`

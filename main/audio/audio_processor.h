@@ -13,6 +13,9 @@ public:
     virtual ~AudioProcessor() = default;
     
     virtual void Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) = 0;
+    // Release model/AFE memory. Only meaningful for AFE-backed processors; the
+    // owner must re-Initialize before using the processor again.
+    virtual void Deinitialize() {}
     virtual void Feed(std::vector<int16_t>&& data) = 0;
     virtual void Start() = 0;
     virtual void Stop() = 0;

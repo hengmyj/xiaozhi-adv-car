@@ -25,6 +25,7 @@ public:
     ~AfeWakeWord();
 
     bool Initialize(AudioCodec* codec, srmodel_list_t* models_list);
+    void Deinitialize() override;
     void Feed(const std::vector<int16_t>& data);
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
     void Start();

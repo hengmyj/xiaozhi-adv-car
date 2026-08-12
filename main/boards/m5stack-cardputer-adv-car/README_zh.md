@@ -67,7 +67,7 @@ m5stack-cardputer-adv-car/
 | `foc/cmd` | 转向 `{"dir":1\|-1,"speed":…}`（`1` 左 / `-1` 右） |
 | `car/state` | 反馈 `{"run","speed","pwm"}`（本板订阅） |
 
-完整协议、架构图与网页仪表盘映射见项目文档：**[docs/car-mqtt-control.md](../../../docs/car-mqtt-control.md)**。
+完整协议、架构图与网页仪表盘映射见项目文档：**[docs/mqtt/car-mqtt-control.md](../../../docs/mqtt/car-mqtt-control.md)**。
 
 ## 硬件
 

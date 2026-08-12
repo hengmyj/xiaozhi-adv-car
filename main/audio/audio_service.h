@@ -134,6 +134,11 @@ public:
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
+    // Free wakenet/AFE memory so an exclusive-audio page can afford its decoder.
+    // Both are re-created on the next EnableWakeWordDetection/EnableVoiceProcessing.
+    void ReleaseAudioModels();
+    void RestoreAudioModels();
+
     // Direct codec playback (e.g. Radio HLS): hold ES8311 TX so power-save cannot mute.
     void SetExternalPlaybackActive(bool active);
     void NotifyOutputActivity();

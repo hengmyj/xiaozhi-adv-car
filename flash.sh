@@ -47,12 +47,20 @@ ensure_board_sdkconfig() {
       echo 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/8m_adv_car.csv"'
     } >> sdkconfig
   fi
-  # Keep partition + slim audio codecs in sync (radio needs AAC/TS only).
+  # Keep partition + slim audio codecs in sync (radio: MP3 + AAC/TS).
   if ! grep -q 'partitions/v2/8m_adv_car.csv' sdkconfig 2>/dev/null; then
     echo 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/8m_adv_car.csv"' >> sdkconfig
   fi
+  # 顺序有意义：choice 里旧的 =y 必须先置 n，否则 kconfig 会用靠后的那条。
   for kv in \
-    'CONFIG_AUDIO_DECODER_MP3_SUPPORT=n' \
+    'CONFIG_ESP_CONSOLE_NONE=n' \
+    'CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y' \
+    'CONFIG_LOG_DEFAULT_LEVEL_NONE=n' \
+    'CONFIG_LOG_DEFAULT_LEVEL_INFO=y' \
+    'CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y' \
+    'CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=5' \
+    'CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y' \
+    'CONFIG_AUDIO_DECODER_MP3_SUPPORT=y' \
     'CONFIG_AUDIO_DECODER_G711_SUPPORT=n' \
     'CONFIG_AUDIO_DECODER_AMRNB_SUPPORT=n' \
     'CONFIG_AUDIO_DECODER_AMRWB_SUPPORT=n' \
@@ -92,8 +100,14 @@ echo "╚═══════════════════════�
 echo "IDF: $(idf.py --version 2>/dev/null | head -1)"
 [ -n "$PORT" ] && echo "串口: $PORT" || echo "[WARN] 未检测到 USB 串口；可 PORT=/dev/cu.usbmodemXXX ./flash.sh"
 echo "upload baud: ${BAUD}（慢速: BAUD=115200 ./flash.sh）"
-echo "烧录后串口: ./monitor.sh"
+echo "烧录后串口: ./monitor.sh（不自动开监视；卡住时 ./monitor.sh kill）"
 echo ""
+
+# 释放可能占用串口的监视器，避免 flash 失败或留下 reconnect 死循环
+if pgrep -f 'idf_monitor\.py|idf\.py .*monitor' >/dev/null 2>&1; then
+  echo "[INFO] 发现正在运行的串口监视器，先结束以免占口..."
+  "$SCRIPT_DIR/monitor.sh" kill || true
+fi
 
 ensure_board_sdkconfig
 

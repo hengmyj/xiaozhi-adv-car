@@ -74,6 +74,17 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     }, "audio_communication", 4096, this, 3, NULL);
 }
 
+void AfeAudioProcessor::Deinitialize() {
+    Stop();
+    if (afe_data_ != nullptr) {
+        afe_iface_->destroy(afe_data_);
+        afe_data_ = nullptr;
+    }
+    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
+    input_buffer_.clear();
+    input_buffer_.shrink_to_fit();
+}
+
 AfeAudioProcessor::~AfeAudioProcessor() {
     if (afe_data_ != nullptr) {
         afe_iface_->destroy(afe_data_);

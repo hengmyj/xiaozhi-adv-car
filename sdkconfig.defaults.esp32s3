@@ -28,9 +28,15 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1536
 
 # Keep logs/stdout on the USB cable; GPIO43 is reserved for the external command UART.
-CONFIG_ESP_CONSOLE_NONE=y
-CONFIG_BOOT_ROM_LOG_ALWAYS_OFF=y
-CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+# Console must stay ON: with ESP_CONSOLE_NONE the panic handler prints nowhere, so a
+# reboot loop leaves zero evidence (no Guru Meditation, no backtrace) on the serial port.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+# Give the USB-CDC time to flush the backtrace before the reset re-enumerates the port.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=5
+# Trap stack overflow at the faulting instruction instead of at the next context switch.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 
 # LVGL Graphics
 CONFIG_LV_USE_SNAPSHOT=y

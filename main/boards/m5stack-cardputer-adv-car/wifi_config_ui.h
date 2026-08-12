@@ -89,6 +89,9 @@ private:
     uint32_t last_cursor_toggle_;
     static constexpr uint32_t CURSOR_BLINK_MS = 500;
 
+    // Full-screen overlay — never lv_obj_clean(lv_scr_act()); that frees chat/page widgets.
+    lv_obj_t* overlay_ = nullptr;
+
     // Display constants
     static constexpr int MAX_VISIBLE_ITEMS = 4;
     static constexpr int MAX_INPUT_LENGTH = 64;
@@ -117,6 +120,8 @@ private:
     void HandleResultKey(const KeyEvent& event);
 
     // Helper functions
+    void EnsureOverlay();
+    void DestroyOverlay();
     void DrawHeader(const char* title);
     void DrawFooter(const char* hint);
     void DrawInputField(const char* label, const std::string& value, bool is_password, bool is_active);

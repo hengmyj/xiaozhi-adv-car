@@ -35,6 +35,17 @@ AfeWakeWord::~AfeWakeWord() {
     vEventGroupDelete(event_group_);
 }
 
+void AfeWakeWord::Deinitialize() {
+    Stop();
+    if (afe_data_ != nullptr) {
+        afe_iface_->destroy(afe_data_);
+        afe_data_ = nullptr;
+    }
+    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
+    input_buffer_.clear();
+    input_buffer_.shrink_to_fit();
+}
+
 bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     codec_ = codec;
     int ref_num = codec_->input_reference() ? 1 : 0;

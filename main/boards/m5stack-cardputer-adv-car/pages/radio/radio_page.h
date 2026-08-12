@@ -6,6 +6,7 @@
 #include <lvgl.h>
 
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 
 #include <atomic>
@@ -29,17 +30,17 @@ public:
     bool HandleKey(const KeyEvent& event);
     lv_obj_t* GetRootPanel() const override { return panel_; }
 
+    // Called from the stream task.
     void NotifyLevel(float level);
     void NotifyPlaying();
     void SetStatusHint(const char* hint);
-    bool IsStreamRunning() const;
-    bool IsUserPaused() const;
-    int StationIndex() const;
-    uint32_t StationGeneration() const;
+    bool IsStreamRunning() const { return stream_run_.load(); }
+    bool IsUserPaused() const { return user_paused_.load(); }
+    int StationIndex() const { return station_index_.load(); }
+    uint32_t StationGeneration() const { return station_gen_.load(); }
 
 private:
     void BuildPanel(CardputerAdvCarLcdDisplay* display);
-    void DestroyPanel(CardputerAdvCarLcdDisplay* display);
     void UpdateUi(CardputerAdvCarLcdDisplay* display);
     void StartStream();
     void StopStream();
@@ -52,7 +53,6 @@ private:
     static void StreamTask(void* arg);
 
     static constexpr int kBarCount = 16;
-    static constexpr int kStationCount = 2;
 
     CardputerAdvCarLcdDisplay* display_ = nullptr;
     bool active_ = false;
@@ -69,9 +69,14 @@ private:
     std::atomic<RadioPlayState> play_state_{RadioPlayState::Idle};
     std::atomic<bool> stream_run_{false};
     std::atomic<bool> user_paused_{false};
-    std::atomic<int> station_index_{1};  // default Music / FM974
+    std::atomic<int> station_index_{1};
     std::atomic<uint32_t> station_gen_{0};
     std::atomic<float> level_{0.0f};
     char status_hint_[40] = {};
+
+    // The stream task never touches its own handle; it only gives stream_done_ on
+    // the way out. StopStream joins on that instead of vTaskDelete()-ing a task
+    // that may already have destroyed itself.
     TaskHandle_t stream_task_ = nullptr;
+    SemaphoreHandle_t stream_done_ = nullptr;
 };

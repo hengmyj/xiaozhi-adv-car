@@ -236,10 +236,10 @@ private:
         if (app.GetDeviceState() == kDeviceStateWifiConfiguring && event.pressed) {
             if (event.key_code == KC_W) {
                 ESP_LOGI(TAG, "W key pressed - entering keyboard WiFi config");
-                StartKeyboardWifiConfig();
+                app.Schedule([this]() { StartKeyboardWifiConfig(); });
             } else if (event.key_code == KC_S) {
                 ESP_LOGI(TAG, "S key pressed - showing saved WiFi list");
-                StartKeyboardWifiConfigSaved();
+                app.Schedule([this]() { StartKeyboardWifiConfigSaved(); });
             }
         }
     }
@@ -320,21 +320,33 @@ private:
     }
 
     void StartKeyboardWifiConfig() {
+        if (wifi_config_mode_) {
+            return;
+        }
         ESP_LOGI(TAG, "Starting keyboard WiFi config UI");
+        display_->HideChatUi();
         wifi_config_mode_ = true;
         wifi_config_ui_ = std::make_unique<WifiConfigUI>(display_);
         wifi_config_ui_->SetConnectCallback([this](const std::string& ssid, const std::string& password) {
-            AttemptWifiConnection(ssid, password);
+            Application::GetInstance().Schedule([this, ssid, password]() {
+                AttemptWifiConnection(ssid, password);
+            });
         });
         wifi_config_ui_->Start();
     }
 
     void StartKeyboardWifiConfigSaved() {
+        if (wifi_config_mode_) {
+            return;
+        }
         ESP_LOGI(TAG, "Starting keyboard WiFi config UI (saved list)");
+        display_->HideChatUi();
         wifi_config_mode_ = true;
         wifi_config_ui_ = std::make_unique<WifiConfigUI>(display_);
         wifi_config_ui_->SetConnectCallback([this](const std::string& ssid, const std::string& password) {
-            AttemptWifiConnection(ssid, password);
+            Application::GetInstance().Schedule([this, ssid, password]() {
+                AttemptWifiConnection(ssid, password);
+            });
         });
         wifi_config_ui_->StartWithSavedList();
     }
@@ -371,7 +383,7 @@ private:
         wifi_config_mode_ = false;
         wifi_config_ui_.reset();
 
-        // TODO: wifi_config_ui may call lv_obj_clean on the display tree; restore page UI here.
+        // wifi_config overlay removed in ~WifiConfigUI; restore page UI here.
         page_manager_.RefreshCurrentPage();
 
         auto& app = Application::GetInstance();

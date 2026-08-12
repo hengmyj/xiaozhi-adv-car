@@ -603,6 +603,63 @@ void AudioService::EnableVoiceProcessing(bool enable) {
     }
 }
 
+void AudioService::ReleaseAudioModels() {
+    // Stop() alone leaves the AFE/wakenet buffers allocated, which on a no-PSRAM
+    // board is most of the free internal heap. Exclusive-audio pages (Radio) need
+    // that RAM for their own decoder, so hand it back here. Both are lazily
+    // re-Initialize()d by EnableWakeWordDetection/EnableVoiceProcessing.
+    size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (wake_word_ != nullptr && wake_word_initialized_) {
+        xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        wake_word_->Deinitialize();
+        wake_word_initialized_ = false;
+    }
+    if (audio_processor_ != nullptr && audio_processor_initialized_) {
+        xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        audio_processor_->Deinitialize();
+        audio_processor_initialized_ = false;
+    }
+    // The Opus pair stays open for the whole app lifetime and is the single largest
+    // reclaimable block. An exclusive-audio page speaks to the codec directly and
+    // needs neither, so hand the memory over and rebuild them on the way out.
+    if (opus_encoder_ != nullptr) {
+        esp_opus_enc_close(opus_encoder_);
+        opus_encoder_ = nullptr;
+    }
+    if (opus_decoder_ != nullptr) {
+        esp_opus_dec_close(opus_decoder_);
+        opus_decoder_ = nullptr;
+    }
+    ESP_LOGI(TAG, "released audio models: internal heap %u -> %u", (unsigned)before,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
+void AudioService::RestoreAudioModels() {
+    if (opus_decoder_ == nullptr) {
+        esp_opus_dec_cfg_t cfg = OPUS_DEC_CFG(codec_->output_sample_rate(), OPUS_FRAME_DURATION_MS);
+        if (esp_opus_dec_open(&cfg, sizeof(cfg), &opus_decoder_) != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(TAG, "failed to re-open opus decoder");
+        } else {
+            decoder_sample_rate_ = codec_->output_sample_rate();
+            decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
+            decoder_frame_size_ = decoder_sample_rate_ / 1000 * OPUS_FRAME_DURATION_MS;
+        }
+    }
+    if (opus_encoder_ == nullptr) {
+        esp_opus_enc_config_t cfg = AS_OPUS_ENC_CONFIG();
+        if (esp_opus_enc_open(&cfg, sizeof(cfg), &opus_encoder_) != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(TAG, "failed to re-open opus encoder");
+        } else {
+            encoder_sample_rate_ = 16000;
+            encoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
+            esp_opus_enc_get_frame_size(opus_encoder_, &encoder_frame_size_, &encoder_outbuf_size_);
+            encoder_frame_size_ = encoder_frame_size_ / sizeof(int16_t);
+        }
+    }
+    ESP_LOGI(TAG, "restored audio models, internal heap=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
 void AudioService::EnableAudioTesting(bool enable) {
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");
     if (enable) {

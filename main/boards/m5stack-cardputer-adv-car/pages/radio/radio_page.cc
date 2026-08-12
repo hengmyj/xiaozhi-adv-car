@@ -9,11 +9,8 @@
 #include <font_awesome.h>
 
 #include "esp_audio_simple_dec.h"
-#include "impl/esp_aac_dec.h"
 #include "impl/esp_mp3_dec.h"
-#include "impl/esp_ts_dec.h"
 
-#include <esp_crt_bundle.h>
 #include <esp_http_client.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -41,35 +38,46 @@ constexpr lv_coord_t kBarGap = 3;
 constexpr lv_coord_t kPlotTop = 62;
 constexpr lv_coord_t kPlotH = 48;
 
+// Plain HTTP MPEG1 Layer III only. No HLS, no TS, no TLS: mbedtls' handshake needs
+// ~8-10KB of the *calling task's* stack, which is what a no-PSRAM S3 cannot spare
+// next to an MP3 decoder. Both URLs verified as 64kbps 44100Hz joint stereo.
 struct Station {
     const char* short_name;
     const char* title;
-    const char* mp3_url;   // preferred: continuous HTTP MP3 (no HLS/TS)
-    const char* hls_url;   // fallback MPEG-TS AAC
+    const char* url;
 };
 
-// Prefer qtfm HTTP MP3 (works in browser/curl; avoids HTTPS+HLS heap on no-PSRAM).
-// HLS kept as fallback (official FM974 / CNR CDN).
 constexpr Station kStations[] = {
-    {"News", "CNR1 Voice of China", "http://lhttp.qtfm.cn/live/15318317/64k.mp3",
-     "http://ngcdn001.cnr.cn/live/zgzs/index.m3u8"},
-    {"Music", "FM974 Beijing Music", "http://lhttp.qtfm.cn/live/332/64k.mp3",
-     "https://brtv-radiolive.rbc.cn/alive/fm974.m3u8"},
+    {"News", "CNR1 Voice of China", "http://lhttp.qtfm.cn/live/15318317/64k.mp3"},
+    {"Music", "FM974 Beijing Music", "http://lhttp.qtfm.cn/live/332/64k.mp3"},
 };
 constexpr int kStationCount = static_cast<int>(sizeof(kStations) / sizeof(kStations[0]));
-constexpr int kDefaultStation = 1;  // Music / FM974
+constexpr int kDefaultStation = 1;
 
-constexpr int kHttpChunk = 1536;
-constexpr int kPcmOutMax = 16 * 1024;
-constexpr int kPcmOutInit = 4096;
-constexpr int kPlaylistMax = 4096;
-constexpr int kTaskStack = 12288;
+// This board has no PSRAM and idles at ~44KB free internal SRAM. Disabling the wake
+// word only stops its task, it does not release the AFE, so the whole radio path has
+// to fit in that ~44KB alongside the MP3 decoder (~19KB) and lwIP's DNS/socket needs.
+// Every size below is the measured worst case, not a rounded-up guess.
+constexpr int kHttpChunk = 512;
+constexpr int kInBufBytes = 2 * 1024;   // max MPEG1-L3 frame is 1044B, so one always fits
+constexpr int kPcmOutInit = 5 * 1024;   // 1152 samples * 2ch * 2B = 4608
+constexpr int kPcmOutMax = 8 * 1024;
+// Measured peak usage of this task is ~1.8KB (8192 stack reported 6392 free), so
+// 5KB keeps a ~2.5x margin while handing the rest to the decoder.
+constexpr int kTaskStack = 5120;
+constexpr int kResampleChunk = 512;     // stack-resident, keeps another vector off the heap
+constexpr size_t kMinHeapToStream = 12 * 1024;
 constexpr int kTaskPrio = 3;
-constexpr int kDefaultVolume = 80;
-constexpr int kHttpTimeoutMs = 8000;
-constexpr int kMp3TimeoutMs = 12000;
-constexpr int kSegmentTimeoutMs = 8000;
-constexpr int kMaxSegmentBytes = 320 * 1024;
+// LVGL runs at priority 1 pinned to core 1 (see lcd_display.cc task_affinity=1), so a
+// higher-priority streaming task on core 1 starves it outright and trips the task
+// watchdog on taskLVGL. Keep this off core 1.
+constexpr int kTaskCore = 0;
+constexpr int kHttpTimeoutMs = 6000;
+constexpr int kDefaultVolume = 85;
+constexpr uint32_t kNoPcmAbortBytes = 48 * 1024;
+
+constexpr int kToneMs = 350;
+constexpr int kToneHz = 440;
 
 void StripStyles(lv_obj_t* obj) {
     lv_obj_remove_style_all(obj);
@@ -79,129 +87,6 @@ void StripStyles(lv_obj_t* obj) {
     lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-}
-
-std::string PlaylistBaseUrl(const char* playlist_url) {
-    std::string u = playlist_url ? playlist_url : "";
-    auto slash = u.rfind('/');
-    if (slash == std::string::npos) {
-        return u;
-    }
-    return u.substr(0, slash + 1);
-}
-
-void ConfigureHttpClient(esp_http_client_config_t& cfg, const char* url, int timeout_ms,
-                         bool insecure_tls) {
-    cfg.url = url;
-    cfg.timeout_ms = timeout_ms;
-    cfg.method = HTTP_METHOD_GET;
-    cfg.buffer_size = kHttpChunk;
-    cfg.buffer_size_tx = 512;
-    cfg.user_agent = "Mozilla/5.0 (xiaozhi-ADV-car/radio)";
-    cfg.max_redirection_count = 5;
-    cfg.disable_auto_redirect = false;
-    cfg.keep_alive_enable = false;
-    if (url != nullptr && strncmp(url, "https://", 8) == 0) {
-        if (insecure_tls) {
-            cfg.crt_bundle_attach = nullptr;
-            cfg.skip_cert_common_name_check = true;
-        } else {
-            cfg.crt_bundle_attach = esp_crt_bundle_attach;
-            cfg.skip_cert_common_name_check = false;
-        }
-    }
-}
-
-bool StatusOk(int status) {
-    return status >= 200 && status < 300;
-}
-
-bool FollowRedirectIfNeeded(esp_http_client_handle_t client, esp_err_t& err) {
-    int status = esp_http_client_get_status_code(client);
-    if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) {
-        return true;
-    }
-    if (esp_http_client_set_redirection(client) != ESP_OK) {
-        return false;
-    }
-    esp_http_client_close(client);
-    err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        return false;
-    }
-    (void)esp_http_client_fetch_headers(client);
-    return true;
-}
-
-bool HttpGetTextOnce(RadioPage* page, const char* url, std::string& out, int timeout_ms,
-                     bool insecure_tls) {
-    out.clear();
-    if (page != nullptr && !page->IsStreamRunning()) {
-        return false;
-    }
-
-    esp_http_client_config_t cfg = {};
-    ConfigureHttpClient(cfg, url, timeout_ms, insecure_tls);
-
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (client == nullptr) {
-        ESP_LOGW(TAG, "HTTP init fail %s", url);
-        return false;
-    }
-
-    ESP_LOGI(TAG, "HTTP open playlist insecure=%d %s", insecure_tls ? 1 : 0, url);
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HTTP open fail %s err=%s", url, esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        return false;
-    }
-    int content_len = esp_http_client_fetch_headers(client);
-    if (!FollowRedirectIfNeeded(client, err)) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-    int status = esp_http_client_get_status_code(client);
-    if (!StatusOk(status)) {
-        ESP_LOGW(TAG, "HTTP %d cl=%d for %s", status, content_len, url);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
-    char buf[256];
-    while (page == nullptr || page->IsStreamRunning()) {
-        int n = esp_http_client_read(client, buf, sizeof(buf));
-        if (n < 0) {
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        out.append(buf, n);
-        if (out.size() > kPlaylistMax) {
-            break;
-        }
-        taskYIELD();
-    }
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    ESP_LOGI(TAG, "HTTP GET ok %uB %s", static_cast<unsigned>(out.size()), url);
-    return !out.empty();
-}
-
-bool HttpGetText(RadioPage* page, const char* url, std::string& out, int timeout_ms = kHttpTimeoutMs) {
-    if (HttpGetTextOnce(page, url, out, timeout_ms, false)) {
-        return true;
-    }
-    if (url != nullptr && strncmp(url, "https://", 8) == 0) {
-        if (page != nullptr && !page->IsStreamRunning()) {
-            return false;
-        }
-        return HttpGetTextOnce(page, url, out, timeout_ms, true);
-    }
-    return false;
 }
 
 struct StreamCtx {
@@ -214,483 +99,440 @@ struct StreamCtx {
     float ema_level = 0.0f;
     uint32_t pcm_chunks = 0;
     uint32_t bytes_in = 0;
-    uint32_t decode_ok = 0;
-    uint32_t decode_fail = 0;
+    uint32_t frames_ok = 0;
+    uint32_t frames_bad = 0;
+    uint32_t info_misses = 0;
+    uint32_t consec_bad = 0;
+    bool format_rejected = false;
+    double resample_pos = 0.0;
 };
 
 void FeedPcmToSpeaker(StreamCtx* ctx, const uint8_t* data, uint32_t bytes) {
     if (data == nullptr || bytes < 4 || ctx == nullptr || ctx->page == nullptr) {
         return;
     }
-    if (!ctx->page->IsStreamRunning() || ctx->page->IsUserPaused()) {
+    if (!ctx->page->IsStreamRunning() || ctx->page->IsUserPaused() || ctx->format_rejected) {
         return;
     }
+    // Never guess the PCM format. A wrong rate/channel/width guess is exactly what
+    // turns the speaker into static, so if the decoder cannot state its output
+    // format we stay silent instead of shipping bytes we cannot interpret.
     if (ctx->sample_rate == 0 || ctx->channels == 0) {
-        esp_audio_simple_dec_info_t info {};
-        if (esp_audio_simple_dec_get_info(ctx->dec, &info) == ESP_AUDIO_ERR_OK &&
-            info.sample_rate > 0 && info.channel > 0) {
-            ctx->sample_rate = info.sample_rate;
-            ctx->channels = info.channel;
-            ESP_LOGI(TAG, "stream info rate=%u ch=%u bits=%u", (unsigned)ctx->sample_rate,
-                     (unsigned)ctx->channels, (unsigned)info.bits_per_sample);
-        } else {
-            // Still try to play assuming 48k stereo if info not ready — better than silence.
-            ctx->sample_rate = 48000;
-            ctx->channels = bytes >= 8 ? 2 : 1;
-            ESP_LOGW(TAG, "stream info missing; assume rate=%u ch=%u", (unsigned)ctx->sample_rate,
-                     (unsigned)ctx->channels);
+        esp_audio_simple_dec_info_t info{};
+        if (esp_audio_simple_dec_get_info(ctx->dec, &info) != ESP_AUDIO_ERR_OK ||
+            info.sample_rate == 0 || info.channel == 0) {
+            if (++ctx->info_misses == 1 || (ctx->info_misses % 100) == 0) {
+                ESP_LOGW(TAG, "decoder info not ready (%u) - holding output",
+                         (unsigned)ctx->info_misses);
+            }
+            return;
         }
+        if (info.bits_per_sample != 16) {
+            ESP_LOGE(TAG, "unsupported bits_per_sample=%u; refusing to play",
+                     (unsigned)info.bits_per_sample);
+            ctx->format_rejected = true;
+            ctx->page->SetStatusHint("bad pcm format");
+            return;
+        }
+        ctx->sample_rate = info.sample_rate;
+        ctx->channels = info.channel;
+        auto* c = Board::GetInstance().GetAudioCodec();
+        ESP_LOGI(TAG, "decoded PCM: %uHz %uch %ubit -> codec %dHz mono", (unsigned)info.sample_rate,
+                 (unsigned)info.channel, (unsigned)info.bits_per_sample,
+                 c != nullptr ? c->output_sample_rate() : -1);
     }
 
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec == nullptr) {
         return;
     }
-    if (!codec->output_enabled()) {
-        codec->EnableOutput(true);
-    }
+    // Output stays powered because AudioService holds it via SetExternalPlaybackActive().
+    // Toggling EnableOutput() from here would race the audio-power esp_timer and the
+    // AudioService output task inside esp_codec_dev_write().
     Application::GetInstance().GetAudioService().NotifyOutputActivity();
 
-    const int16_t* in = reinterpret_cast<const int16_t*>(data);
     const int ch = ctx->channels > 0 ? ctx->channels : 1;
     const int in_frames = static_cast<int>(bytes / sizeof(int16_t) / ch);
     if (in_frames <= 0) {
         return;
     }
-
     const int out_rate = codec->output_sample_rate();
     const int src_rate = static_cast<int>(ctx->sample_rate);
     if (out_rate <= 0 || src_rate <= 0) {
         return;
     }
 
-    // Fractional resample (handles 44100?24000 and 48000?24000).
-    int out_frames = static_cast<int>((static_cast<int64_t>(in_frames) * out_rate) / src_rate);
-    if (out_frames < 1) {
-        out_frames = 1;
-    }
-    ctx->resample.clear();
-    ctx->resample.reserve(static_cast<size_t>(out_frames) + 8);
+    const int16_t* in = reinterpret_cast<const int16_t*>(data);
+    const double step = static_cast<double>(src_rate) / static_cast<double>(out_rate);
 
+    // Downmix to mono and rate-convert into one reusable buffer, flushing whenever
+    // it fills. It is sized once at startup: allocating per frame (38 times a
+    // second) would fragment a heap that is already nearly full.
+    std::vector<int16_t>& out = ctx->resample;
+    int n_out = 0;
     double energy = 0;
     int energy_n = 0;
-    for (int j = 0; j < out_frames; ++j) {
-        int i = static_cast<int>((static_cast<int64_t>(j) * src_rate) / out_rate);
-        if (i >= in_frames) {
-            i = in_frames - 1;
-        }
-        int32_t sample = 0;
+    // resample_pos carries the fractional phase across frames, so restarting the
+    // ratio at every frame boundary cannot inject a periodic click.
+    for (double pos = ctx->resample_pos; pos < in_frames; pos += step) {
+        const int i = static_cast<int>(pos);
+        int32_t sample;
         if (ch >= 2) {
             sample = (static_cast<int32_t>(in[i * ch]) + static_cast<int32_t>(in[i * ch + 1])) / 2;
         } else {
-            sample = in[i * ch];
+            sample = in[i];
         }
-        ctx->resample.push_back(static_cast<int16_t>(sample));
+        out[n_out++] = static_cast<int16_t>(sample);
         energy += static_cast<double>(sample) * static_cast<double>(sample);
         ++energy_n;
+        ctx->resample_pos = pos + step;
+        if (n_out == kResampleChunk) {
+            codec->OutputData(out);  // already exactly kResampleChunk long
+            ++ctx->pcm_chunks;
+            n_out = 0;
+        }
+    }
+    ctx->resample_pos -= in_frames;
+    if (ctx->resample_pos < 0) {
+        ctx->resample_pos = 0;
+    }
+    if (n_out > 0) {
+        // resize down then back up reuses the same allocation (capacity is kept).
+        out.resize(n_out);
+        codec->OutputData(out);
+        out.resize(kResampleChunk);
+        ++ctx->pcm_chunks;
     }
 
-    if (!ctx->resample.empty()) {
-        codec->OutputData(ctx->resample);
-        ++ctx->pcm_chunks;
+    if (ctx->pcm_chunks > 0) {
         ctx->page->NotifyPlaying();
-        if (ctx->pcm_chunks == 1 || (ctx->pcm_chunks % 50) == 0) {
-            ESP_LOGI(TAG, "pcm out chunks=%u samples=%u rate=%u->%u vol=%d heap=%u",
-                     (unsigned)ctx->pcm_chunks, (unsigned)ctx->resample.size(),
-                     (unsigned)src_rate, (unsigned)out_rate, codec->output_volume(),
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        if (ctx->pcm_chunks == 1 || (ctx->pcm_chunks % 200) == 0) {
+            ESP_LOGI(TAG, "pcm chunks=%u %u->%uHz ch=%d vol=%d heap=%u stack_free=%u",
+                     (unsigned)ctx->pcm_chunks, (unsigned)src_rate, (unsigned)out_rate, ch,
+                     codec->output_volume(),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)uxTaskGetStackHighWaterMark(nullptr));
         }
     }
     if (energy_n > 0) {
-        float rms = static_cast<float>(std::sqrt(energy / energy_n) / 32768.0);
+        const float rms = static_cast<float>(std::sqrt(energy / energy_n) / 32768.0);
         ctx->ema_level = ctx->ema_level * 0.7f + rms * 0.3f;
         ctx->page->NotifyLevel(ctx->ema_level);
     }
 }
 
-esp_err_t DecodeChunk(StreamCtx* ctx, uint8_t* data, int len) {
-    if (ctx->dec == nullptr || data == nullptr || len <= 0) {
-        return ESP_OK;
-    }
+// Decode every whole frame sitting in buf[0..fill). Returns the number of bytes
+// consumed; the caller keeps the remainder for the next socket read.
+// Feed the simple decoder the way its API intends: hand it whatever arrived and let
+// its parser find the frames, advancing by however much it reports consuming. The
+// earlier hand-rolled frame splitter fought the parser and desynced it.
+int DecodeBuffered(StreamCtx* ctx, uint8_t* buf, int fill) {
     esp_audio_simple_dec_raw_t raw = {};
-    raw.buffer = data;
-    raw.len = static_cast<uint32_t>(len);
+    raw.buffer = buf;
+    raw.len = static_cast<uint32_t>(fill);
     raw.eos = false;
     raw.consumed = 0;
 
-    int spins = 0;
-    while (raw.consumed < raw.len) {
+    int off = 0;
+    while (raw.len > 0) {
         if (ctx->page != nullptr && !ctx->page->IsStreamRunning()) {
             break;
         }
-        if (ctx->pcm.size() < kPcmOutInit) {
-            ctx->pcm.resize(kPcmOutInit);
-        }
-        esp_audio_simple_dec_out_t frame = {};
-        frame.buffer = ctx->pcm.data();
-        frame.len = static_cast<uint32_t>(ctx->pcm.size());
 
-        uint32_t before = raw.consumed;
-        esp_audio_err_t ret = esp_audio_simple_dec_process(ctx->dec, &raw, &frame);
-        if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-            uint32_t need = frame.needed_size > 0 ? frame.needed_size
-                                                 : static_cast<uint32_t>(ctx->pcm.size() * 2);
-            if (need > kPcmOutMax) {
-                need = kPcmOutMax;
+        bool had_error = false;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (ctx->pcm.size() < kPcmOutInit) {
+                ctx->pcm.resize(kPcmOutInit);
             }
-            if (need <= ctx->pcm.size()) {
-                ESP_LOGW(TAG, "dec need=%u but pcm already %u — drop", (unsigned)need,
-                         (unsigned)ctx->pcm.size());
+            esp_audio_simple_dec_out_t frame = {};
+            frame.buffer = ctx->pcm.data();
+            frame.len = static_cast<uint32_t>(ctx->pcm.size());
+
+            const esp_audio_err_t ret = esp_audio_simple_dec_process(ctx->dec, &raw, &frame);
+            if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+                uint32_t need = frame.needed_size > 0 ? frame.needed_size
+                                                      : (uint32_t)(ctx->pcm.size() * 2);
+                if (need > kPcmOutMax) {
+                    need = kPcmOutMax;
+                }
+                if (need <= ctx->pcm.size()) {
+                    break;
+                }
+                ctx->pcm.resize(need);
+                continue;  // retry the same frame with a bigger sink
+            }
+            if (ret != ESP_AUDIO_ERR_OK) {
+                had_error = true;
+                ++ctx->frames_bad;
+                if ((ctx->frames_bad % 200) == 1) {
+                    ESP_LOGW(TAG, "decode ret=%d (bad=%u ok=%u)", (int)ret,
+                             (unsigned)ctx->frames_bad, (unsigned)ctx->frames_ok);
+                }
+                // Only bail out if the decoder has never produced a single sample.
+                // A stream start carries ID3 tags and a partial frame, so early
+                // errors are normal and must not kill an otherwise healthy stream.
+                if (++ctx->consec_bad > 2000 && ctx->pcm_chunks == 0) {
+                    ESP_LOGE(TAG, "decoder failed %u times with no PCM ever; aborting",
+                             (unsigned)ctx->consec_bad);
+                    ctx->format_rejected = true;
+                    if (ctx->page != nullptr) {
+                        ctx->page->SetStatusHint("decode failed");
+                    }
+                }
                 break;
             }
-            ctx->pcm.resize(need);
-            continue;
-        }
-        if (ret != ESP_AUDIO_ERR_OK) {
-            ++ctx->decode_fail;
-            if ((ctx->decode_fail % 30) == 1) {
-                ESP_LOGW(TAG, "dec process ret=%d consumed=%u/%u", (int)ret,
-                         (unsigned)raw.consumed, (unsigned)raw.len);
+            ctx->consec_bad = 0;
+            ++ctx->frames_ok;
+            // ESP_AUDIO_ERR_OK also covers "input cached, nothing decoded yet", so
+            // decoded_size is the only thing that says PCM actually exists.
+            if (frame.decoded_size > 0) {
+                if (frame.decoded_size > ctx->pcm.size()) {
+                    ESP_LOGE(TAG, "decoder overran sink: %u > %u", (unsigned)frame.decoded_size,
+                             (unsigned)ctx->pcm.size());
+                    ctx->format_rejected = true;
+                    break;
+                }
+                FeedPcmToSpeaker(ctx, frame.buffer, frame.decoded_size);
             }
-            // Skip one byte to resync rather than stall forever on bad frame.
-            if (raw.consumed == before) {
-                raw.consumed++;
-            }
-            continue;
-        }
-        if (frame.decoded_size > 0) {
-            ++ctx->decode_ok;
-            FeedPcmToSpeaker(ctx, frame.buffer, frame.decoded_size);
-        }
-        if (raw.consumed == before) {
             break;
         }
-        if (++spins > 64) {
-            taskYIELD();
-            spins = 0;
+
+        if (ctx->format_rejected) {
+            break;
         }
+        if (raw.consumed == 0) {
+            if (had_error) {
+                // Bad byte the parser could not use: slide one byte so we always
+                // make progress instead of retrying the same data forever.
+                ++raw.buffer;
+                --raw.len;
+                ++off;
+                continue;
+            }
+            // Parser wants more data before it can complete a frame; keep the
+            // remainder and come back after the next socket read.
+            break;
+        }
+        const uint32_t step = raw.consumed > raw.len ? raw.len : raw.consumed;
+        raw.buffer += step;
+        raw.len -= step;
+        off += static_cast<int>(step);
+        raw.consumed = 0;
     }
-    return ESP_OK;
+    return off;
 }
 
-bool OpenDecoder(StreamCtx* ctx, esp_audio_simple_dec_type_t type) {
+bool OpenDecoder(StreamCtx* ctx) {
     if (ctx->dec != nullptr) {
         esp_audio_simple_dec_close(ctx->dec);
         ctx->dec = nullptr;
     }
-    esp_ts_dec_cfg_t ts_cfg = {.aac_plus_enable = true};
-    esp_audio_simple_dec_cfg_t dec_cfg = {};
-    dec_cfg.dec_type = type;
-    dec_cfg.use_frame_dec = false;
-    if (type == ESP_AUDIO_SIMPLE_DEC_TYPE_TS) {
-        dec_cfg.dec_cfg = &ts_cfg;
-        dec_cfg.cfg_size = sizeof(ts_cfg);
-    } else {
-        dec_cfg.dec_cfg = nullptr;
-        dec_cfg.cfg_size = 0;
-    }
-    if (esp_audio_simple_dec_open(&dec_cfg, &ctx->dec) != ESP_AUDIO_ERR_OK) {
-        ESP_LOGE(TAG, "decoder open failed type=%u", (unsigned)type);
+    esp_audio_simple_dec_cfg_t cfg = {};
+    cfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
+    // Keep the library parser. It handles ID3 tags, initial sync and free-format
+    // frames that a hand-rolled frame splitter gets wrong, and now that the decoder
+    // is allocated first there is room for it.
+    cfg.use_frame_dec = false;
+    cfg.dec_cfg = nullptr;
+    cfg.cfg_size = 0;
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const esp_audio_err_t ret = esp_audio_simple_dec_open(&cfg, &ctx->dec);
+    const size_t after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (ret != ESP_AUDIO_ERR_OK) {
+        ESP_LOGE(TAG, "mp3 decoder open failed ret=%d (heap was %uB)", (int)ret,
+                 (unsigned)before);
         ctx->dec = nullptr;
         return false;
     }
+    ESP_LOGI(TAG, "mp3 decoder open ok: used %uB, heap %u -> %u", (unsigned)(before - after),
+             (unsigned)before, (unsigned)after);
     ctx->sample_rate = 0;
     ctx->channels = 0;
-    ESP_LOGI(TAG, "decoder open ok type=%u", (unsigned)type);
+    ctx->resample_pos = 0.0;
     return true;
 }
 
-bool PlayMp3Once(StreamCtx* ctx, const char* url, uint32_t bound_gen) {
-    if (ctx->page == nullptr || url == nullptr || !ctx->page->IsStreamRunning()) {
+// Speaker self-test. If this beep is audible the ES8311 route, PA, volume and I2S
+// clocking are all fine and any remaining silence is a network/decode problem.
+void PlayTestTone(int ms, int hz) {
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec == nullptr) {
+        return;
+    }
+    const int rate = codec->output_sample_rate();
+    if (rate <= 0) {
+        return;
+    }
+    const int block = rate / 50;  // 20 ms
+    const int blocks = (ms * rate / 1000) / block;
+    std::vector<int16_t> buf(block);
+    double phase = 0.0;
+    const double step = 2.0 * M_PI * hz / rate;
+    for (int b = 0; b < blocks; ++b) {
+        for (int i = 0; i < block; ++i) {
+            buf[i] = static_cast<int16_t>(8000.0 * std::sin(phase));
+            phase += step;
+        }
+        codec->OutputData(buf);
+        Application::GetInstance().GetAudioService().NotifyOutputActivity();
+    }
+    ESP_LOGI(TAG, "self-test tone done: %dHz %dms at %dHz vol=%d out_en=%d", hz, ms, rate,
+             codec->output_volume(), codec->output_enabled() ? 1 : 0);
+}
+
+bool PlayStationOnce(StreamCtx* ctx, const Station& station, uint32_t bound_gen) {
+    RadioPage* page = ctx->page;
+    if (page == nullptr || !page->IsStreamRunning()) {
         return false;
     }
-    if (!OpenDecoder(ctx, ESP_AUDIO_SIMPLE_DEC_TYPE_MP3)) {
-        ctx->page->SetStatusHint("mp3 decoder fail");
+    const size_t heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (heap < kMinHeapToStream) {
+        // Below this, getaddrinfo() fails with EAI_MEMORY and esp_http_client's
+        // allocations start returning NULL, which is how this page used to die.
+        ESP_LOGE(TAG, "refusing to stream: only %uB internal heap free", (unsigned)heap);
+        page->SetStatusHint("low memory");
+        vTaskDelay(pdMS_TO_TICKS(1000));
         return false;
     }
 
     esp_http_client_config_t cfg = {};
-    ConfigureHttpClient(cfg, url, kMp3TimeoutMs, false);
+    cfg.url = station.url;
+    cfg.timeout_ms = kHttpTimeoutMs;
+    cfg.method = HTTP_METHOD_GET;
+    cfg.buffer_size = kHttpChunk;
+    cfg.buffer_size_tx = 512;
+    cfg.user_agent = "Mozilla/5.0 (xiaozhi-ADV-car/radio)";
+    cfg.max_redirection_count = 5;
+    cfg.keep_alive_enable = false;
+
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == nullptr) {
-        ctx->page->SetStatusHint("http init fail");
+        page->SetStatusHint("http init fail");
         return false;
     }
 
-    ESP_LOGI(TAG, "MP3 open %s heap=%u", url,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    ctx->page->SetStatusHint("mp3 connecting");
+    ESP_LOGI(TAG, "open %s heap=%u stack_free=%u", station.url,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    page->SetStatusHint("connecting");
+
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "MP3 open fail err=%s", esp_err_to_name(err));
-        ctx->page->SetStatusHint("mp3 open fail");
+        ESP_LOGW(TAG, "open fail %s", esp_err_to_name(err));
+        page->SetStatusHint("connect fail");
         esp_http_client_cleanup(client);
         return false;
     }
     (void)esp_http_client_fetch_headers(client);
-    if (!FollowRedirectIfNeeded(client, err)) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        ctx->page->SetStatusHint("mp3 redirect fail");
-        return false;
-    }
-    int status = esp_http_client_get_status_code(client);
-    if (!StatusOk(status)) {
-        ESP_LOGW(TAG, "MP3 HTTP %d", status);
-        ctx->page->SetStatusHint("mp3 HTTP err");
+    const int status = esp_http_client_get_status_code(client);
+    if (status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "HTTP %d", status);
+        page->SetStatusHint("http error");
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return false;
     }
 
-    std::vector<uint8_t> chunk(kHttpChunk);
+    // The decoder is opened once for the whole task (see StreamTask); reset it so a
+    // reconnect starts from a clean state without paying the allocation again.
+    esp_audio_simple_dec_reset(ctx->dec);
+    ctx->sample_rate = 0;
+    ctx->channels = 0;
+    ctx->resample_pos = 0.0;
+    ctx->consec_bad = 0;
+
+    std::vector<uint8_t> inbuf(kInBufBytes);
+    int fill = 0;
     uint32_t total = 0;
-    uint32_t pcm_at_start = ctx->pcm_chunks;
+    const uint32_t pcm_at_start = ctx->pcm_chunks;
     int idle_reads = 0;
+    uint32_t reads = 0;
+    // Every loop exit sets this, so the serial log always names the precise reason
+    // the stream stopped instead of just going quiet.
+    const char* exit_reason = "user stop / page change";
 
-    while (ctx->page->IsStreamRunning() && ctx->page->StationGeneration() == bound_gen) {
-        if (ctx->page->IsUserPaused()) {
+    while (page->IsStreamRunning() && page->StationGeneration() == bound_gen) {
+        if (page->IsUserPaused()) {
             vTaskDelay(pdMS_TO_TICKS(80));
             continue;
         }
-        int n = esp_http_client_read(client, reinterpret_cast<char*>(chunk.data()), kHttpChunk);
+        int room = kInBufBytes - fill;
+        if (room < kHttpChunk) {
+            // No frame header found in a whole buffer: drop the oldest half.
+            const int drop = kInBufBytes / 2;
+            memmove(inbuf.data(), inbuf.data() + drop, kInBufBytes - drop);
+            fill -= drop;
+            room = kInBufBytes - fill;
+        }
+        const int n = esp_http_client_read(client, reinterpret_cast<char*>(inbuf.data() + fill),
+                                           room < kHttpChunk ? room : kHttpChunk);
         if (n < 0) {
-            ESP_LOGW(TAG, "MP3 read err %d after %uB pcm=%u", n, (unsigned)total,
+            ESP_LOGW(TAG, "read err %d after %uB pcm=%u", n, (unsigned)total,
                      (unsigned)(ctx->pcm_chunks - pcm_at_start));
+            exit_reason = "http read error";
             break;
         }
         if (n == 0) {
-            ++idle_reads;
-            if (idle_reads > 3) {
+            // A live stream can legitimately stall for a moment. Only give up after
+            // ~1s of nothing, so a hiccup is not mistaken for end-of-stream.
+            if (++idle_reads > 20) {
+                ESP_LOGW(TAG, "no data for ~1s after %uB", (unsigned)total);
+                exit_reason = "stream idle (EOF or timeout)";
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         idle_reads = 0;
+        fill += n;
         total += static_cast<uint32_t>(n);
         ctx->bytes_in += static_cast<uint32_t>(n);
-        DecodeChunk(ctx, chunk.data(), n);
-        if ((total % (kHttpChunk * 16)) == 0) {
-            taskYIELD();
+
+        const uint32_t pcm_before = ctx->pcm_chunks;
+        const int used = DecodeBuffered(ctx, inbuf.data(), fill);
+        // Trace the first reads in full, then thin out: this is what shows whether
+        // the stream dies at the socket, at the decoder, or at the codec write.
+        if (++reads <= 8 || (reads % 100) == 0) {
+            ESP_LOGI(TAG, "read#%u n=%d fill=%d used=%d ok=%u bad=%u writes+=%u total=%uB",
+                     (unsigned)reads, n, fill, used, (unsigned)ctx->frames_ok,
+                     (unsigned)ctx->frames_bad, (unsigned)(ctx->pcm_chunks - pcm_before),
+                     (unsigned)total);
         }
+        if (used > 0 && used < fill) {
+            memmove(inbuf.data(), inbuf.data() + used, fill - used);
+        }
+        fill -= used;
+
+        if (ctx->format_rejected) {
+            ESP_LOGE(TAG, "stopping: decoder unusable for this stream");
+            exit_reason = "decoder rejected/failed";
+            break;
+        }
+        if (ctx->pcm_chunks == pcm_at_start && total >= kNoPcmAbortBytes) {
+            ESP_LOGW(TAG, "abort: %uB in, no PCM (ok=%u bad=%u)", (unsigned)total,
+                     (unsigned)ctx->frames_ok, (unsigned)ctx->frames_bad);
+            exit_reason = "no PCM produced";
+            break;
+        }
+        // vTaskDelay, not taskYIELD: taskYIELD never lets the lower-priority IDLE
+        // task run, which is what starves the CPU1 idle watchdog.
+        vTaskDelay(1);
     }
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
     const uint32_t pcm_delta = ctx->pcm_chunks - pcm_at_start;
-    ESP_LOGI(TAG, "MP3 session bytes=%u pcm_chunks=%u dec_ok=%u dec_fail=%u", (unsigned)total,
-             (unsigned)pcm_delta, (unsigned)ctx->decode_ok, (unsigned)ctx->decode_fail);
+    ESP_LOGI(TAG, "session end [%s] bytes=%u reads=%u pcm_writes=%u frames_ok=%u bad=%u heap=%u stack_free=%u",
+             exit_reason, (unsigned)total, (unsigned)reads, (unsigned)pcm_delta,
+             (unsigned)ctx->frames_ok, (unsigned)ctx->frames_bad,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     if (pcm_delta == 0) {
-        ctx->page->SetStatusHint("mp3 no PCM");
+        page->SetStatusHint("no audio data");
         return false;
     }
     return true;
-}
-
-bool PlayTsSegmentOnce(StreamCtx* ctx, const std::string& url, bool insecure_tls) {
-    if (ctx->page == nullptr || !ctx->page->IsStreamRunning()) {
-        return false;
-    }
-
-    esp_http_client_config_t cfg = {};
-    ConfigureHttpClient(cfg, url.c_str(), kSegmentTimeoutMs, insecure_tls);
-
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (client == nullptr) {
-        return false;
-    }
-    ESP_LOGI(TAG, "segment open insecure=%d %s", insecure_tls ? 1 : 0, url.c_str());
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return false;
-    }
-    (void)esp_http_client_fetch_headers(client);
-    if (!FollowRedirectIfNeeded(client, err)) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-    int status = esp_http_client_get_status_code(client);
-    if (!StatusOk(status)) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
-    std::vector<uint8_t> chunk(kHttpChunk);
-    bool ok = false;
-    uint32_t total = 0;
-    uint32_t reads = 0;
-    while (ctx->page != nullptr && ctx->page->IsStreamRunning()) {
-        if (ctx->page->IsUserPaused()) {
-            vTaskDelay(pdMS_TO_TICKS(80));
-            continue;
-        }
-        int n = esp_http_client_read(client, reinterpret_cast<char*>(chunk.data()), kHttpChunk);
-        if (n < 0) {
-            break;
-        }
-        if (n == 0) {
-            ok = total > 0;
-            break;
-        }
-        total += static_cast<uint32_t>(n);
-        ctx->bytes_in += static_cast<uint32_t>(n);
-        DecodeChunk(ctx, chunk.data(), n);
-        ok = true;
-        ++reads;
-        if ((reads % 8) == 0) {
-            taskYIELD();
-        }
-        if (total > kMaxSegmentBytes) {
-            ok = true;
-            break;
-        }
-    }
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    ESP_LOGI(TAG, "segment done ok=%d bytes=%u pcm_chunks=%u", ok ? 1 : 0, (unsigned)total,
-             (unsigned)ctx->pcm_chunks);
-    return ok;
-}
-
-bool PlayTsSegment(StreamCtx* ctx, const std::string& url) {
-    if (PlayTsSegmentOnce(ctx, url, false)) {
-        return true;
-    }
-    if (ctx->page != nullptr && !ctx->page->IsStreamRunning()) {
-        return false;
-    }
-    if (url.rfind("https://", 0) == 0) {
-        return PlayTsSegmentOnce(ctx, url, true);
-    }
-    return false;
-}
-
-bool ResolveUri(const std::string& base_url, const std::string& line, std::string& out) {
-    if (line.rfind("http://", 0) == 0 || line.rfind("https://", 0) == 0) {
-        out = line;
-        return true;
-    }
-    out = base_url + line;
-    return !out.empty();
-}
-
-bool ParsePlaylist(const std::string& body, const std::string& base_url,
-                   std::vector<std::string>& segs, uint32_t& media_seq,
-                   std::string* nested_playlist) {
-    segs.clear();
-    media_seq = 0;
-    if (nested_playlist != nullptr) {
-        nested_playlist->clear();
-    }
-    bool is_master = body.find("#EXT-X-STREAM-INF") != std::string::npos;
-    size_t pos = 0;
-    while (pos < body.size()) {
-        size_t end = body.find('\n', pos);
-        if (end == std::string::npos) {
-            end = body.size();
-        }
-        std::string line = body.substr(pos, end - pos);
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        pos = end + 1;
-
-        if (line.rfind("#EXT-X-MEDIA-SEQUENCE:", 0) == 0) {
-            media_seq = static_cast<uint32_t>(std::strtoul(line.c_str() + 22, nullptr, 10));
-            continue;
-        }
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-        std::string uri;
-        if (!ResolveUri(base_url, line, uri)) {
-            continue;
-        }
-        if (is_master && nested_playlist != nullptr && nested_playlist->empty()) {
-            *nested_playlist = uri;
-            return false;
-        }
-        segs.push_back(uri);
-    }
-    return !segs.empty();
-}
-
-bool PlayHlsCycle(StreamCtx* ctx, const Station& station, uint32_t bound_gen, uint32_t& last_seq,
-                  bool& have_last) {
-    if (station.hls_url == nullptr || ctx->page == nullptr) {
-        return false;
-    }
-    if (!OpenDecoder(ctx, ESP_AUDIO_SIMPLE_DEC_TYPE_TS)) {
-        ctx->page->SetStatusHint("ts decoder fail");
-        return false;
-    }
-    ctx->page->SetStatusHint("hls connecting");
-
-    const std::string base = PlaylistBaseUrl(station.hls_url);
-    std::string playlist;
-    std::string nested;
-    if (!HttpGetText(ctx->page, station.hls_url, playlist)) {
-        ctx->page->SetStatusHint("hls playlist fail");
-        return false;
-    }
-
-    std::vector<std::string> segs;
-    uint32_t media_seq = 0;
-    if (!ParsePlaylist(playlist, base, segs, media_seq, &nested)) {
-        if (!nested.empty()) {
-            const std::string nested_base = PlaylistBaseUrl(nested.c_str());
-            std::string media_body;
-            if (!HttpGetText(ctx->page, nested.c_str(), media_body) ||
-                !ParsePlaylist(media_body, nested_base, segs, media_seq, nullptr)) {
-                ctx->page->SetStatusHint("hls variant fail");
-                return false;
-            }
-        } else {
-            ctx->page->SetStatusHint("hls empty");
-            return false;
-        }
-    }
-
-    size_t start = 0;
-    if (have_last) {
-        if (media_seq + segs.size() <= last_seq + 1) {
-            vTaskDelay(pdMS_TO_TICKS(400));
-            return true;  // waiting for next segment is OK
-        }
-        uint32_t want = last_seq + 1;
-        if (want >= media_seq) {
-            start = want - media_seq;
-        } else {
-            start = segs.size() > 1 ? segs.size() - 1 : 0;
-        }
-    } else {
-        start = segs.size() > 2 ? segs.size() - 2 : 0;
-    }
-
-    bool any = false;
-    for (size_t i = start; i < segs.size() && ctx->page->IsStreamRunning(); ++i) {
-        if (ctx->page->StationGeneration() != bound_gen || ctx->page->IsUserPaused()) {
-            break;
-        }
-        if (PlayTsSegment(ctx, segs[i])) {
-            last_seq = media_seq + static_cast<uint32_t>(i);
-            have_last = true;
-            any = true;
-        } else {
-            break;
-        }
-        taskYIELD();
-    }
-    if (!any && ctx->pcm_chunks == 0) {
-        ctx->page->SetStatusHint("hls no PCM");
-    }
-    return any || ctx->pcm_chunks > 0;
 }
 
 }  // namespace
@@ -719,39 +561,6 @@ void RadioPage::SetStatusHint(const char* hint) {
     std::snprintf(status_hint_, sizeof(status_hint_), "%s", hint);
 }
 
-bool RadioPage::IsStreamRunning() const {
-    return stream_run_.load();
-}
-
-bool RadioPage::IsUserPaused() const {
-    return user_paused_.load();
-}
-
-int RadioPage::StationIndex() const {
-    return station_index_.load();
-}
-
-uint32_t RadioPage::StationGeneration() const {
-    return station_gen_.load();
-}
-
-void RadioPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
-    if (panel_ == nullptr || display == nullptr) {
-        return;
-    }
-    DisplayLockGuard lock(display);
-    lv_obj_del(panel_);
-    panel_ = nullptr;
-    status_label_ = nullptr;
-    station_label_ = nullptr;
-    listening_label_ = nullptr;
-    play_label_ = nullptr;
-    vol_label_ = nullptr;
-    for (int i = 0; i < kBarCount; ++i) {
-        bars_[i] = nullptr;
-    }
-}
-
 void RadioPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ != nullptr) {
         return;
@@ -778,7 +587,7 @@ void RadioPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     lv_obj_align(listening_label_, LV_ALIGN_TOP_MID, 10, 4);
 
     vol_label_ = lv_label_create(panel_);
-    lv_label_set_text(vol_label_, "vol80");
+    lv_label_set_text(vol_label_, "vol85");
     lv_obj_set_style_text_font(vol_label_, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(vol_label_, lv_color_hex(0xAAAAAA), 0);
     lv_obj_align(vol_label_, LV_ALIGN_TOP_RIGHT, -6, 4);
@@ -817,87 +626,95 @@ void RadioPage::CaptureAudioExclusive() {
     if (audio_exclusive_) {
         return;
     }
-    auto& app = Application::GetInstance();
-    auto& audio = app.GetAudioService();
+    auto& audio = Application::GetInstance().GetAudioService();
     audio.EnableWakeWordDetection(false);
     audio.EnableVoiceProcessing(false);
-    audio.ResetDecoder();
+    // Stopping them is not enough. The MP3 decoder core needs ~25KB and this board
+    // has no PSRAM, so the Opus pair (unused while the radio plays) must actually be
+    // freed or esp_mp3_dec fails to init with ESP_AUDIO_ERR_MEM_LACK.
+    audio.ReleaseAudioModels();
+    // This is the only thing that should touch codec power: it enables output and
+    // pins it on for as long as the hold is active.
     audio.SetExternalPlaybackActive(true);
     audio_exclusive_ = true;
 
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
         codec->SetOutputVolume(kDefaultVolume);
-        codec->EnableOutput(true);
-        ESP_LOGI(TAG, "audio exclusive ON vol=%d out=%d", codec->output_volume(),
-                 codec->output_enabled() ? 1 : 0);
+        ESP_LOGI(TAG, "audio exclusive ON vol=%d out=%d in=%d rate=%d", codec->output_volume(),
+                 codec->output_enabled() ? 1 : 0, codec->input_enabled() ? 1 : 0,
+                 codec->output_sample_rate());
     }
 }
 
 void RadioPage::ReleaseAudioExclusive() {
     if (!audio_exclusive_) {
-        Application::GetInstance().GetAudioService().SetExternalPlaybackActive(false);
-        Application::GetInstance().RestoreAudioRouting();
         return;
     }
     audio_exclusive_ = false;
     auto& app = Application::GetInstance();
     app.GetAudioService().SetExternalPlaybackActive(false);
+    // Rebuild the Opus codecs before the chat path can need them again.
+    app.GetAudioService().RestoreAudioModels();
     app.RestoreAudioRouting();
-    ESP_LOGI(TAG, "audio exclusive OFF + RestoreAudioRouting");
+    ESP_LOGI(TAG, "audio exclusive OFF");
 }
 
 void RadioPage::StreamTask(void* arg) {
     auto* self = static_cast<RadioPage*>(arg);
-    StreamCtx ctx;
-    ctx.page = self;
-    ctx.pcm.reserve(kPcmOutInit);
-    ctx.resample.reserve(1024);
 
-    ESP_LOGI(TAG, "StreamTask start heap=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "StreamTask start heap=%u stack=%d",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), kTaskStack);
 
-    static bool codecs_ready = false;
-    if (!codecs_ready) {
-        bool ok = true;
-        if (esp_mp3_dec_register() != ESP_AUDIO_ERR_OK) {
-            ESP_LOGE(TAG, "MP3 register failed");
-            ok = false;
-        }
-        if (esp_aac_dec_register() != ESP_AUDIO_ERR_OK || esp_ts_dec_register() != ESP_AUDIO_ERR_OK) {
-            ESP_LOGW(TAG, "AAC/TS register failed (HLS fallback unavailable)");
-        }
-        if (!ok) {
+    static bool mp3_registered = false;
+    if (!mp3_registered) {
+        const esp_audio_err_t reg = esp_mp3_dec_register();
+        const esp_audio_err_t sup =
+            esp_audio_simple_check_audio_type(ESP_AUDIO_SIMPLE_DEC_TYPE_MP3);
+        if (reg != ESP_AUDIO_ERR_OK || sup != ESP_AUDIO_ERR_OK) {
+            // Bail out loudly. Playing on without a decoder is what sends raw MP3
+            // bytes to the speaker as if they were PCM.
+            ESP_LOGE(TAG, "MP3 unavailable (register=%d check=%d); CONFIG_AUDIO_DECODER_MP3_SUPPORT?",
+                     (int)reg, (int)sup);
             self->play_state_.store(RadioPlayState::Error);
-            self->SetStatusHint("codec register fail");
-            self->stream_task_ = nullptr;
+            self->SetStatusHint("no mp3 decoder");
+            xSemaphoreGive(self->stream_done_);
             vTaskDelete(nullptr);
             return;
         }
-        codecs_ready = true;
-        ESP_LOGI(TAG, "MP3(+AAC/TS) codecs registered");
+        mp3_registered = true;
+        ESP_LOGI(TAG, "MP3 decoder registered and supported");
     }
+
+    StreamCtx ctx;
+    ctx.page = self;
+
+    // Open the decoder before anything else claims memory: it is by far the largest
+    // single allocation, and with ~44KB of internal SRAM on this board it only fits
+    // if it gets first pick. It then stays open for the life of the task.
+    if (!OpenDecoder(&ctx)) {
+        self->play_state_.store(RadioPlayState::Error);
+        self->SetStatusHint("no memory for mp3");
+        xSemaphoreGive(self->stream_done_);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ctx.pcm.resize(kPcmOutInit);
+    ctx.resample.resize(kResampleChunk);
+    ESP_LOGI(TAG, "buffers ready, heap=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    PlayTestTone(kToneMs, kToneHz);
 
     int fail_streak = 0;
     uint32_t bound_gen = self->StationGeneration();
-    int bound_station = self->StationIndex();
-    uint32_t hls_last_seq = 0;
-    bool hls_have_last = false;
 
     while (self->stream_run_.load()) {
-        uint32_t gen = self->StationGeneration();
-        int st = self->StationIndex();
-        if (gen != bound_gen || st != bound_station) {
-            bound_gen = gen;
-            bound_station = st;
-            fail_streak = 0;
-            hls_have_last = false;
-            hls_last_seq = 0;
-            ctx.pcm_chunks = 0;
-            ctx.bytes_in = 0;
-            ctx.decode_ok = 0;
-            ctx.decode_fail = 0;
-            ESP_LOGI(TAG, "station switch -> %d %s", st, kStations[st].short_name);
+        bound_gen = self->StationGeneration();
+        int idx = self->StationIndex();
+        if (idx < 0 || idx >= kStationCount) {
+            idx = kDefaultStation;
         }
 
         if (self->IsUserPaused()) {
@@ -906,48 +723,26 @@ void RadioPage::StreamTask(void* arg) {
             continue;
         }
 
-        if (bound_station < 0 || bound_station >= kStationCount) {
-            bound_station = 0;
-        }
-        const Station& station = kStations[bound_station];
         self->play_state_.store(RadioPlayState::Connecting);
-
-        bool ok = false;
-        // 1) Prefer continuous MP3 (HTTP) — rock-solid on no-PSRAM.
-        if (station.mp3_url != nullptr && self->stream_run_.load()) {
-            ESP_LOGI(TAG, "try MP3 %s", station.mp3_url);
-            ok = PlayMp3Once(&ctx, station.mp3_url, bound_gen);
-        }
-        // 2) HLS fallback if MP3 failed and we still want this station.
-        if (!ok && station.hls_url != nullptr && self->stream_run_.load() &&
-            self->StationGeneration() == bound_gen && !self->IsUserPaused()) {
-            ESP_LOGW(TAG, "MP3 failed/ended — try HLS %s", station.hls_url);
-            ok = PlayHlsCycle(&ctx, station, bound_gen, hls_last_seq, hls_have_last);
-        }
+        const bool ok = PlayStationOnce(&ctx, kStations[idx], bound_gen);
 
         if (!self->stream_run_.load()) {
             break;
         }
-        if (self->StationGeneration() != bound_gen) {
-            continue;
-        }
-
         if (ok) {
             fail_streak = 0;
-            // MP3 sessions end on read timeout — reconnect promptly.
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-
-        fail_streak++;
-        ESP_LOGW(TAG, "play fail streak=%d station=%s", fail_streak, station.short_name);
-        if (fail_streak > 3) {
+        ++fail_streak;
+        ESP_LOGW(TAG, "play fail streak=%d station=%s", fail_streak, kStations[idx].short_name);
+        if (fail_streak >= 3) {
             self->play_state_.store(RadioPlayState::Error);
             if (self->status_hint_[0] == '\0') {
                 self->SetStatusHint("stream fail");
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(600));
+        vTaskDelay(pdMS_TO_TICKS(800));
     }
 
     if (ctx.dec != nullptr) {
@@ -955,10 +750,10 @@ void RadioPage::StreamTask(void* arg) {
         ctx.dec = nullptr;
     }
 
-    ESP_LOGI(TAG, "StreamTask exit pcm_chunks=%u bytes_in=%u", (unsigned)ctx.pcm_chunks,
-             (unsigned)ctx.bytes_in);
+    ESP_LOGI(TAG, "StreamTask exit pcm=%u bytes=%u stack_free=%u", (unsigned)ctx.pcm_chunks,
+             (unsigned)ctx.bytes_in, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     self->play_state_.store(RadioPlayState::Idle);
-    self->stream_task_ = nullptr;
+    xSemaphoreGive(self->stream_done_);
     vTaskDelete(nullptr);
 }
 
@@ -966,47 +761,74 @@ void RadioPage::StartStream() {
     if (stream_task_ != nullptr) {
         return;
     }
+    if (stream_done_ == nullptr) {
+        stream_done_ = xSemaphoreCreateBinary();
+        if (stream_done_ == nullptr) {
+            ESP_LOGE(TAG, "semaphore alloc failed");
+            play_state_.store(RadioPlayState::Error);
+            SetStatusHint("out of memory");
+            return;
+        }
+    }
+    // Drop a token left behind by a join that timed out, so the next StopStream
+    // cannot return while this new task is still alive.
+    xSemaphoreTake(stream_done_, 0);
+
+    // Take the codec here, on the main loop, before allocating the stack: tearing
+    // down the wake-word/AFE pipeline releases a large block of internal SRAM, and
+    // this board does not have enough free to carve out the task stack without it.
+    // Capture/release now pair on the same thread (StartStream / StopStream).
+    ESP_LOGI(TAG, "heap before capture=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    CaptureAudioExclusive();
+    ESP_LOGI(TAG, "heap after capture=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
     stream_run_.store(true);
     user_paused_.store(false);
     play_state_.store(RadioPlayState::Connecting);
     level_.store(0.0f);
     SetStatusHint("connecting");
-    BaseType_t ok = xTaskCreatePinnedToCore(StreamTask, "radio_stream", kTaskStack, this, kTaskPrio,
-                                              &stream_task_, 0);
+
+    const BaseType_t ok = xTaskCreatePinnedToCore(StreamTask, "radio_stream", kTaskStack, this,
+                                                  kTaskPrio, &stream_task_, kTaskCore);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "stream task create failed heap=%u",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         stream_run_.store(false);
         stream_task_ = nullptr;
         play_state_.store(RadioPlayState::Error);
-        SetStatusHint("task create fail");
-    } else {
-        ESP_LOGI(TAG, "stream task created");
+        SetStatusHint("low memory");
+        ReleaseAudioExclusive();
     }
 }
 
 void RadioPage::StopStream() {
-    ESP_LOGI(TAG, "StopStream begin task=%p", stream_task_);
+    if (stream_task_ == nullptr) {
+        ReleaseAudioExclusive();
+        return;
+    }
+    ESP_LOGI(TAG, "StopStream begin");
     stream_run_.store(false);
     user_paused_.store(false);
-    for (int i = 0; i < 200 && stream_task_ != nullptr; ++i) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Bounded join. Reads use a 6s socket timeout and the decode loop checks
+    // stream_run_ every frame, so this normally returns in well under a second.
+    if (xSemaphoreTake(stream_done_, pdMS_TO_TICKS(4000)) != pdTRUE) {
+        // Never vTaskDelete() here: the task may be mid-syscall (or already gone),
+        // and killing it would leak its socket and leave driver mutexes locked.
+        ESP_LOGE(TAG, "stream task did not exit in 4s; leaving it to finish");
     }
-    if (stream_task_ != nullptr) {
-        ESP_LOGW(TAG, "stream task stuck — last-resort delete");
-        vTaskDelete(stream_task_);
-        stream_task_ = nullptr;
-    }
+    stream_task_ = nullptr;
     play_state_.store(RadioPlayState::Idle);
     level_.store(0.0f);
-    ESP_LOGI(TAG, "StopStream end");
+    ReleaseAudioExclusive();
+    ESP_LOGI(TAG, "StopStream end heap=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
 void RadioPage::SelectStation(int index) {
-    if (index < 0 || index >= kStationCount) {
-        return;
-    }
-    if (station_index_.load() == index) {
+    if (index < 0 || index >= kStationCount || station_index_.load() == index) {
         return;
     }
     station_index_.store(index);
@@ -1018,10 +840,9 @@ void RadioPage::SelectStation(int index) {
 }
 
 void RadioPage::TogglePause() {
-    bool next = !user_paused_.load();
+    const bool next = !user_paused_.load();
     user_paused_.store(next);
     play_state_.store(next ? RadioPlayState::Paused : RadioPlayState::Connecting);
-    ESP_LOGI(TAG, "TogglePause -> %s", next ? "paused" : "play");
 }
 
 void RadioPage::AdjustVolume(int delta) {
@@ -1037,7 +858,6 @@ void RadioPage::AdjustVolume(int delta) {
         vol = 100;
     }
     codec->SetOutputVolume(vol);
-    ESP_LOGI(TAG, "volume=%d", vol);
 }
 
 void RadioPage::UpdateUi(CardputerAdvCarLcdDisplay* display) {
@@ -1045,14 +865,14 @@ void RadioPage::UpdateUi(CardputerAdvCarLcdDisplay* display) {
         return;
     }
 
-    RadioPlayState st = play_state_.load();
-    float lvl = level_.load();
+    const RadioPlayState st = play_state_.load();
+    const float lvl = level_.load();
     int st_idx = station_index_.load();
     if (st_idx < 0 || st_idx >= kStationCount) {
         st_idx = 0;
     }
     auto* codec = Board::GetInstance().GetAudioCodec();
-    int vol = codec != nullptr ? codec->output_volume() : 0;
+    const int vol = codec != nullptr ? codec->output_volume() : 0;
 
     DisplayLockGuard lock(display);
     if (station_label_ != nullptr) {
@@ -1105,16 +925,14 @@ void RadioPage::UpdateUi(CardputerAdvCarLcdDisplay* display) {
         }
     }
     if (status_label_ != nullptr) {
-        if (st == RadioPlayState::Error && status_hint_[0] != '\0') {
+        if ((st == RadioPlayState::Error || st == RadioPlayState::Connecting) &&
+            status_hint_[0] != '\0') {
             lv_label_set_text(status_label_, status_hint_);
-            lv_obj_set_style_text_color(status_label_, lv_color_hex(0xFF5555), 0);
-        } else if (st == RadioPlayState::Connecting && status_hint_[0] != '\0') {
-            lv_label_set_text(status_label_, status_hint_);
-            lv_obj_set_style_text_color(status_label_, lv_color_hex(0xAAAAAA), 0);
+            lv_obj_set_style_text_color(
+                status_label_, lv_color_hex(st == RadioPlayState::Error ? 0xFF5555 : 0xAAAAAA), 0);
         } else {
-            lv_label_set_text(status_label_,
-                              st_idx == 0 ? "[News] Music  ,/ / N/M"
-                                          : "News [Music]  ,/ / N/M");
+            lv_label_set_text(status_label_, st_idx == 0 ? "[News] Music  ,/ / N/M"
+                                                        : "News [Music]  ,/ / N/M");
             lv_obj_set_style_text_color(status_label_, lv_color_hex(0xAAAAAA), 0);
         }
     }
@@ -1138,8 +956,7 @@ void RadioPage::UpdateUi(CardputerAdvCarLcdDisplay* display) {
         }
         lv_obj_set_size(bars_[i], kBarW, h);
         lv_obj_set_pos(bars_[i], plot_x + i * (kBarW + kBarGap), kPlotTop + kPlotH - h);
-        uint32_t color = (i % 5 == 0) ? 0x00FFFF : 0x00FF66;
-        lv_obj_set_style_bg_color(bars_[i], lv_color_hex(color), 0);
+        lv_obj_set_style_bg_color(bars_[i], lv_color_hex((i % 5 == 0) ? 0x00FFFF : 0x00FF66), 0);
     }
 }
 
@@ -1152,15 +969,13 @@ void RadioPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     if (station_index_.load() < 0 || station_index_.load() >= kStationCount) {
         station_index_.store(kDefaultStation);
     }
-    ESP_LOGI(TAG, "OnEnter radio station=%d (%s) heap=%u", station_index_.load(),
+    ESP_LOGI(TAG, "OnEnter station=%d (%s) heap=%u", station_index_.load(),
              kStations[station_index_.load()].short_name,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-    CaptureAudioExclusive();
     BuildPanel(display);
     if (panel_ == nullptr) {
         ESP_LOGE(TAG, "BuildPanel failed");
-        ReleaseAudioExclusive();
         active_ = false;
         return;
     }
@@ -1171,20 +986,23 @@ void RadioPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
         if (station_label_ != nullptr) {
             lv_label_set_text(station_label_, kStations[station_index_.load()].title);
         }
-        if (listening_label_ != nullptr) {
-            lv_label_set_text(listening_label_, "connecting");
-            lv_obj_set_style_text_color(listening_label_, lv_color_hex(0xFFAA00), 0);
-        }
     }
     display->HideChatUi();
     user_paused_.store(false);
-    StartStream();
+    play_state_.store(RadioPlayState::Connecting);
+    SetStatusHint("connecting");
+    // Deferred so PageManager::ShowPage can clear switching_ first. Capturing `this`
+    // is safe: RadioPage is a by-value member of PageManager and outlives the app.
+    Application::GetInstance().Schedule([this]() {
+        if (active_) {
+            StartStream();
+        }
+    });
 }
 
 void RadioPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
     active_ = false;
     StopStream();
-    ReleaseAudioExclusive();
     if (display == nullptr || panel_ == nullptr) {
         return;
     }
@@ -1200,15 +1018,17 @@ bool RadioPage::HandleKey(const KeyEvent& event) {
     if (!active_ || !event.pressed || event.is_modifier) {
         return true;
     }
-    const char ch = event.key_char ? static_cast<char>(std::tolower(static_cast<unsigned char>(event.key_char[0]))) : '\0';
+    const char ch = event.key_char ? static_cast<char>(std::tolower(
+                                         static_cast<unsigned char>(event.key_char[0])))
+                                   : '\0';
 
-    if (event.key_code == KC_1 || event.key_code == KC_N || event.key_code == KC_COMMA || ch == '1' ||
-        ch == 'n' || ch == ',') {
+    if (event.key_code == KC_1 || event.key_code == KC_N || event.key_code == KC_COMMA ||
+        ch == '1' || ch == 'n' || ch == ',') {
         SelectStation(0);
         return true;
     }
-    if (event.key_code == KC_2 || event.key_code == KC_M || event.key_code == KC_SLASH || ch == '2' ||
-        ch == 'm' || ch == '/') {
+    if (event.key_code == KC_2 || event.key_code == KC_M || event.key_code == KC_SLASH ||
+        ch == '2' || ch == 'm' || ch == '/') {
         SelectStation(1);
         return true;
     }

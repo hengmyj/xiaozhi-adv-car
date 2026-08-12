@@ -13,6 +13,9 @@ public:
     virtual ~WakeWord() = default;
     
     virtual bool Initialize(AudioCodec* codec, srmodel_list_t* models_list) = 0;
+    // Release model/AFE memory. Only meaningful for AFE-backed wake words; the
+    // owner must re-Initialize before using the wake word again.
+    virtual void Deinitialize() {}
     virtual void Feed(const std::vector<int16_t>& data) = 0;
     virtual void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) = 0;
     virtual void Start() = 0;
