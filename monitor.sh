@@ -3,6 +3,9 @@
 #
 # 需先 source IDF 或使用默认 IDF_PATH（同 flash.sh）。
 #
+# 必须在有 TTY 的本机终端跑（Cursor Terminal 面板）。Agent / 管道环境会直接拒绝，
+# 不会去跑 idf_monitor（否则报 Monitor requires standard input to be attached to TTY）。
+#
 # 退出方式：
 #   Ctrl+]              idf_monitor 官方退出键（推荐）
 #   Ctrl+T 然后 Ctrl+X  菜单退出
@@ -46,6 +49,16 @@ if [ "${1:-}" = "kill" ] || [ "${1:-}" = "--kill" ]; then
   exit 0
 fi
 
+# Agent / CI 没有控制终端：提前退出，避免 source IDF 后再被 idf_monitor 拒绝。
+if [ ! -t 0 ] && ! (exec <>/dev/tty) 2>/dev/null; then
+  echo "[ERROR] 当前环境没有 TTY，无法监听串口（idf_monitor 需要标准输入接到终端）。"
+  echo "  请在 Cursor 本机终端（Terminal 面板）执行，不要从 Agent 对话里跑："
+  echo "    cd ~/Documents/esp/xiaozhi-ADV-car && ./monitor.sh"
+  echo "  卡住时: ./monitor.sh kill"
+  echo "  USB 掉线时先: ls /dev/cu.usbmodem* ，没有就拔插数据线。"
+  exit 1
+fi
+
 if [ ! -f "$IDF_PATH/export.sh" ]; then
   echo "[ERROR] 找不到 export.sh，请设置 IDF_PATH（当前: ${IDF_PATH}）"
   exit 1
@@ -75,7 +88,9 @@ echo ""
 
 # 用独立 session 跑 idf.py：终端 Ctrl+C 打到本包装进程，再杀整棵监视器树。
 # （前台直接跑 idf_monitor 时，Ctrl+C 被其吞掉并打印 “please use Ctrl+]”，无法退出。）
-python3 - "$PORT" "$BAUD" <<'PY'
+# 脚本走 fd 3，避免 stdin heredoc 把 TTY 变成管道（idf_monitor 会因此直接退出）。
+# 子进程 stdin 接到 /dev/tty，Cursor 集成终端也能过 isatty()。
+python3 /dev/fd/3 "$PORT" "$BAUD" 3<<'PY'
 import os
 import signal
 import subprocess
@@ -84,7 +99,17 @@ import sys
 port, baud = sys.argv[1], sys.argv[2]
 cmd = ["idf.py", "-p", port, "-b", baud, "monitor"]
 
-proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+try:
+    tty_fd = os.open("/dev/tty", os.O_RDWR)
+except OSError:
+    print(
+        "[ERROR] 无法打开 /dev/tty。请在 Cursor 本机终端运行 ./monitor.sh，不要从 Agent 跑。",
+        file=sys.stderr,
+        flush=True,
+    )
+    sys.exit(1)
+
+proc = subprocess.Popen(cmd, stdin=tty_fd, preexec_fn=os.setsid)
 
 
 def _stop(signum, _frame):
