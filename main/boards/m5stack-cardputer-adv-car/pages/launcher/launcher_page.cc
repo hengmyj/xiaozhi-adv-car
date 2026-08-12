@@ -138,6 +138,8 @@ void LauncherPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ == nullptr || display == nullptr) {
         return;
     }
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t before_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     DisplayLockGuard lock(display);
     lv_obj_del(panel_);
     panel_ = nullptr;
@@ -145,6 +147,13 @@ void LauncherPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     for (int i = 0; i < kAppCount; ++i) {
         btns_[i] = nullptr;
     }
+    ESP_LOGI(TAG, "DestroyPanel launcher heap %u->%u largest %u->%u", (unsigned)before,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)before_largest,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+void LauncherPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    DestroyPanel(display);
 }
 
 void LauncherPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {

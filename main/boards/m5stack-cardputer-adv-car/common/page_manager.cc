@@ -97,6 +97,33 @@ Page* PageManager::GetPage(PageId id) {
     }
 }
 
+void PageManager::ReleaseOtherExclusiveUi(PageId keep) {
+    static const PageId kExclusive[] = {
+        PageId::Car,      PageId::Spider, PageId::MjAc,  PageId::Launcher,
+        PageId::Clock,    PageId::Matrix, PageId::Music, PageId::Radio,
+    };
+    const size_t before = FreeHeap();
+    const size_t before_largest = LargestHeap();
+    int n = 0;
+    for (PageId id : kExclusive) {
+        if (id == keep) {
+            continue;
+        }
+        Page* page = GetPage(id);
+        if (page == nullptr || page->GetRootPanel() == nullptr) {
+            continue;
+        }
+        ESP_LOGI(TAG, "sweep destroy page %d heap=%u largest=%u", static_cast<int>(id),
+                 static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
+        page->ReleaseResidentUi(display_);
+        ++n;
+    }
+    ESP_LOGI(TAG, "sweep destroyed %d exclusive panels keep=%d heap %u->%u largest %u->%u", n,
+             static_cast<int>(keep), static_cast<unsigned>(before),
+             static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(before_largest),
+             static_cast<unsigned>(LargestHeap()));
+}
+
 void PageManager::RecoverToChat(const char* reason) {
     ESP_LOGE(TAG, "RecoverToChat: %s (was page %d) heap=%u largest=%u", reason,
              static_cast<int>(current_), static_cast<unsigned>(FreeHeap()),
@@ -164,9 +191,15 @@ void PageManager::ShowPage(PageId id) {
             ESP_LOGI(TAG, "released resident UI %d heap=%u largest=%u", static_cast<int>(prev),
                      static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
         }
+        if (id == PageId::Radio) {
+            ReleaseOtherExclusiveUi(PageId::Radio);
+        }
         current_ = id;
         next->OnEnter(display_);
     } else {
+        if (id == PageId::Radio) {
+            ReleaseOtherExclusiveUi(PageId::Radio);
+        }
         current_ = id;
         next->OnEnter(display_);
         current->OnLeave(display_);

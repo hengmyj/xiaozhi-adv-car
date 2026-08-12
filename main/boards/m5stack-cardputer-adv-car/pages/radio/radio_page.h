@@ -26,6 +26,7 @@ class RadioPage : public Page {
 public:
     void OnEnter(CardputerAdvCarLcdDisplay* display) override;
     void OnLeave(CardputerAdvCarLcdDisplay* display) override;
+    void ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) override;
     void Tick(CardputerAdvCarLcdDisplay* display);
     bool HandleKey(const KeyEvent& event);
     lv_obj_t* GetRootPanel() const override { return panel_; }
@@ -46,6 +47,7 @@ public:
 
 private:
     void BuildPanel(CardputerAdvCarLcdDisplay* display);
+    void DestroyPanel(CardputerAdvCarLcdDisplay* display);
     void UpdateUi(CardputerAdvCarLcdDisplay* display);
     void StartStream();
     void StopStream();

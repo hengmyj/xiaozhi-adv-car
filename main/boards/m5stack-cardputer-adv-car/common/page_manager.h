@@ -52,4 +52,5 @@ private:
 
     Page* GetPage(PageId id);
     void RecoverToChat(const char* reason);
+    void ReleaseOtherExclusiveUi(PageId keep);
 };

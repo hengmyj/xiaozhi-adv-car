@@ -34,7 +34,7 @@ Cardputer ADV（ESP32-S3FN8 + 8MB flash，**无 PSRAM**）上 Radio 页从「卡
 released audio models: internal heap 27340 -> 70432
 ```
 
-低于 `kMinHeapToStream`（12KB）直接拒绝开流并提示 `low memory`，不再靠崩溃暴露问题。
+总空闲低于 `kMinHeapToStream`（12KB）才拒绝开流并提示 `low memory`。`largest < 20KB` **只告警仍尝试**，以 decoder 真失败（`MEM_LACK`）为准，避免切几下页面后碎片化误杀。
 
 ## 关键坑
 
@@ -90,7 +90,8 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 | 日志 | 含义 / 处理 |
 |------|-------------|
 | `ESP_MP3_DEC: There is no memory for MP3 required`、ret `10` | 内存不足，Opus 未释放或余量被别处吃掉 |
-| `refusing to stream: only ...B internal heap free` | 低于 12KB 阈值，主动不开流（UI 提示 `low memory`） |
+| `refusing to stream: only ...B free` / `StartStream refuse: heap` | 总空闲低于 12KB，主动不开流（UI 提示 `low memory`） |
+| `StartStream: largest ... < 20KB (trying decoder anyway)` | 最大块偏小但仍尝试；随后看 `mp3 decoder open ok` 或 `MEM_LACK` |
 | `getaddrinfo() returns 202` / `HTTP_CLIENT: Allocation failed` | 内存已见底，随后大概率重启 |
 | `decoder info not ready (N) - holding output` | parser 还没锁到帧，正在静音等待（少量正常） |
 | `unsupported bits_per_sample=...; refusing to play` | 格式不符，主动静音而非播噪音 |
@@ -185,7 +186,7 @@ MQTT 客户端开机常驻，离页不断开。IceBox IR worker（4KB 栈 + `IRM
 | 4 Clock | hidden | panel+canvas 对象约 **1–3KB** | canvas BSS **19.6KB** |
 | 5 Rain | hidden | 同上约 **1–3KB** | canvas BSS **16.3KB** |
 | 6 Music | DestroyPanel | 24 柱+网格，约 **10–15KB**（已释放） | — |
-| Launcher | hidden 复用 | MYJ 点阵+7 按钮，较重；Music→Radio 已证明 **可与 Radio 共存** | — |
+| Launcher | hidden 复用（进 Radio 前 Destroy） | MYJ 点阵+7 按钮，较重；与 Radio 24 柱叠在一起会压垮 largest | — |
 
 Car/IceBox 的 hidden 仪表盘才是 1–4→Radio 的主因；Clock/Matrix 对象虽小，hidden panel 仍碎片化最大块，故同样 Destroy。
 
@@ -193,8 +194,9 @@ Car/IceBox 的 hidden 仪表盘才是 1–4→Radio 的主因；Clock/Matrix 对
 
 - **Clock / Matrix**：`OnLeave` 一律 `DestroyPanel`（重建便宜；canvas BSS 仍在）
 - **Car / Spider / IceBox**：`PageManager` 在 Leave 之后调用 `ReleaseResidentUi`（`lv_obj_del`），**仅当下一页不是 Car/Spider/IceBox**。仪表盘互切仍复用 panel，避免 IceBox→Car 卡死回归
-- Launcher / Radio panel **继续复用**
-- 日志：各页 Leave 后 `heap`/`largest`；Radio `OnEnter` / Capture / `MEM_LACK`；`StartStream` 若 `largest < 20KB` 直接 `low memory`
+- Launcher 在进 **非 Radio** 页时仍 hidden 复用；**进 Radio 前 sweep Destroy**（含 Launcher）
+- Radio 离页 **DestroyPanel**（不再 hidden 常驻 24 柱）
+- 日志：各页 Leave 后 `heap`/`largest`；Radio `OnEnter` / Capture / `MEM_LACK`；`StartStream` 若 `largest < 20KB` **只告警仍尝试**，真失败看 decoder `MEM_LACK`
 
 串口对照：`release resident UI` → `ReleaseResidentUi dashboard heap A->B largest C->D`（或 Clock/Matrix/IceBox `DestroyPanel`）→ Radio `OnEnter ... largest=` → `heap after capture` → `mp3 decoder open ok` → `pcm chunks=`。
 
@@ -209,6 +211,30 @@ Car/IceBox 的 hidden 仪表盘才是 1–4→Radio 的主因；Clock/Matrix 对
 - [ ] 开机直进 7 Radio
 - [ ] Radio → Chat 语音仍可用
 - [ ] IceBox → Launcher → Car（切页不卡死）
+- [ ] 来回切 1–7 与 Launcher **至少 10 次** 后再进 Radio，仍能播（不应再 `stream err / low memory`）
+
+### 切几下就 stream err / low memory
+
+#### 现象
+
+开机 Radio 能播；在 1–7 与 Launcher 之间切几次再进 Radio，UI 显示 **stream err / low memory**，无法继续播放。
+
+#### 根因（门槛误杀 + 面板常驻碎片化，不是 decoder/HTTP 泄漏）
+
+1. **Radio / Launcher 离页只 hidden、不 Destroy**。Radio 24 柱 + Launcher MYJ 点阵各约 8–15KB LVGL 对象，第一次进过之后一直占着内部 SRAM。Car/Clock/Music 在旁边反复 Build/Destroy，把 **最大空闲块** 碎片化到 20KB 以下。
+2. **`kMinLargestToStream = 20KB` 预检过严**：切几次后 `largest` 掉到 12–18KB 就直接 `low memory`，其实 Helix 仍可能解码成功。decoder / HTTP / stream task / `vis_buf`（任务栈上）进出页是成对的，没有叠开第二路流。
+3. `BuildPanel` 在 `panel_ != nullptr` 时直接 return，**不会每次进 Radio 新建 24 柱**；问题是旧面板从不释放。
+
+`heap_caps_malloc_extmem_enable` 与本板无关（无 PSRAM）。
+
+#### 修复
+
+- Radio `OnLeave`：`StopStream` 后 **DestroyPanel**（decoder/http/task 仍由 StopStream 成对关闭）
+- 进 Radio 前 `PageManager::ReleaseOtherExclusiveUi`：**Destroy 所有其他独占页**（含 Launcher）；只留 Chat UI + 当前 Radio
+- 进 Radio 时先 `CaptureAudioExclusive`（释放 Opus）再 BuildPanel，让后续 MP3 拿到更大连续块
+- `largest < 20KB` 改为告警，**仍尝试开流**；只有总空闲 < 12KB 或 decoder `MEM_LACK` / `xTaskCreate` 失败才报错
+
+串口对照：`sweep destroy page 5`（Launcher）→ `DestroyPanel launcher heap/largest` → Radio `OnEnter` → `audio exclusive ON` → `mp3 decoder open ok` → `pcm chunks=`。切页离开应有 `DestroyPanel radio`。
 
 ## 遗留项
 

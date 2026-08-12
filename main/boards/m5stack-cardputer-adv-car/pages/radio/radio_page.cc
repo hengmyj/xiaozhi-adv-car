@@ -69,8 +69,11 @@ constexpr int kPcmOutMax = 8 * 1024;
 constexpr int kTaskStack = 5120;
 constexpr int kResampleChunk = 512;     // stack-resident, keeps another vector off the heap
 constexpr size_t kMinHeapToStream = 12 * 1024;
-// Helix MP3 true-decode needs a contiguous internal block; open() is lazy (~148B).
-constexpr size_t kMinLargestToStream = 20 * 1024;
+// Helix MP3 true-decode wants ~16–20KB contiguous, but after a few page
+// switches the largest block often sits at 12–18KB from LVGL fragmentation
+// while the decoder can still succeed. Do not refuse on largest; warn and
+// let open/process report MEM_LACK. Task create still needs a stack-sized hole.
+constexpr size_t kWarnLargestToStream = 20 * 1024;
 constexpr int kTaskPrio = 3;
 // LVGL runs at priority 1 pinned to core 1 (see lcd_display.cc task_affinity=1), so a
 // higher-priority streaming task on core 1 starves it outright and trips the task
@@ -715,6 +718,32 @@ void RadioPage::SetStatusHint(const char* hint) {
     std::snprintf(status_hint_, sizeof(status_hint_), "%s", hint);
 }
 
+void RadioPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
+    if (panel_ == nullptr || display == nullptr) {
+        return;
+    }
+    const size_t before = InternalHeapFree();
+    const size_t before_largest = InternalHeapLargest();
+    DisplayLockGuard lock(display);
+    lv_obj_del(panel_);
+    panel_ = nullptr;
+    status_label_ = nullptr;
+    station_label_ = nullptr;
+    listening_label_ = nullptr;
+    play_label_ = nullptr;
+    vol_label_ = nullptr;
+    for (int i = 0; i < kBarCount; ++i) {
+        bars_[i] = nullptr;
+    }
+    ESP_LOGI(TAG, "DestroyPanel radio heap %u->%u largest %u->%u", (unsigned)before,
+             (unsigned)InternalHeapFree(), (unsigned)before_largest,
+             (unsigned)InternalHeapLargest());
+}
+
+void RadioPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    DestroyPanel(display);
+}
+
 void RadioPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ != nullptr) {
         return;
@@ -1039,15 +1068,20 @@ void RadioPage::StartStream() {
     ESP_LOGI(TAG, "heap after capture free=%u largest=%u", (unsigned)InternalHeapFree(),
              (unsigned)InternalHeapLargest());
 
-    if (InternalHeapFree() < kMinHeapToStream || InternalHeapLargest() < kMinLargestToStream) {
-        ESP_LOGE(TAG,
-                 "StartStream refuse: heap %u largest %u (min free %u largest %u) after ReleaseAudioModels",
-                 (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest(),
-                 (unsigned)kMinHeapToStream, (unsigned)kMinLargestToStream);
+    const size_t free_now = InternalHeapFree();
+    const size_t largest_now = InternalHeapLargest();
+    if (free_now < kMinHeapToStream) {
+        ESP_LOGE(TAG, "StartStream refuse: heap %u < %u after ReleaseAudioModels largest=%u",
+                 (unsigned)free_now, (unsigned)kMinHeapToStream, (unsigned)largest_now);
         play_state_.store(RadioPlayState::Error);
         SetStatusHint("low memory");
         ReleaseAudioExclusive();
         return;
+    }
+    if (largest_now < kWarnLargestToStream) {
+        ESP_LOGW(TAG,
+                 "StartStream: largest %u < %u (trying decoder anyway) heap=%u",
+                 (unsigned)largest_now, (unsigned)kWarnLargestToStream, (unsigned)free_now);
     }
 
     stream_run_.store(true);
@@ -1283,10 +1317,15 @@ void RadioPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
              (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest(),
              audio_exclusive_ ? 1 : 0, stream_alive_.load() ? 1 : 0);
 
+    // Free Opus before the 24-bar panel so the decoder later gets first pick of
+    // the hole ReleaseAudioModels just opened. StartStream re-asserts (idempotent).
+    CaptureAudioExclusive();
+
     BuildPanel(display);
     if (panel_ == nullptr) {
         ESP_LOGE(TAG, "BuildPanel failed");
         active_ = false;
+        ReleaseAudioExclusive();
         return;
     }
     {
@@ -1323,11 +1362,7 @@ void RadioPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
              (unsigned)enter_gen_.load(), stream_alive_.load() ? 1 : 0, audio_exclusive_ ? 1 : 0,
              (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest());
     StopStream();
-    if (display == nullptr || panel_ == nullptr) {
-        return;
-    }
-    DisplayLockGuard lock(display);
-    lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
+    DestroyPanel(display);
 }
 
 void RadioPage::Tick(CardputerAdvCarLcdDisplay* display) {

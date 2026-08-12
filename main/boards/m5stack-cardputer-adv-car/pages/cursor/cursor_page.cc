@@ -58,6 +58,10 @@ void CursorPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     }
 }
 
+void CursorPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    DestroyPanel(display);
+}
+
 void CursorPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ != nullptr) {
         return;
