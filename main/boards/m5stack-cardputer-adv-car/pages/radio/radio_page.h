@@ -32,6 +32,7 @@ public:
 
     // Called from the stream task.
     void NotifyLevel(float level);
+    void NotifyBandLevels(const float* energies, int count);
     void NotifyPlaying();
     void SetStatusHint(const char* hint);
     bool IsStreamRunning() const { return stream_run_.load(); }
@@ -52,7 +53,7 @@ private:
 
     static void StreamTask(void* arg);
 
-    static constexpr int kBarCount = 16;
+    static constexpr int kBarCount = 24;
 
     CardputerAdvCarLcdDisplay* display_ = nullptr;
     bool active_ = false;
@@ -65,6 +66,8 @@ private:
     lv_obj_t* play_label_ = nullptr;
     lv_obj_t* vol_label_ = nullptr;
     lv_obj_t* bars_[kBarCount] = {};
+    float band_levels_[kBarCount] = {};
+    float band_peak_ = 200.0f;
 
     std::atomic<RadioPlayState> play_state_{RadioPlayState::Idle};
     std::atomic<bool> stream_run_{false};

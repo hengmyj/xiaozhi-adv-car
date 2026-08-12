@@ -33,10 +33,12 @@ namespace {
 
 constexpr lv_coord_t kScreenW = 240;
 constexpr lv_coord_t kScreenH = 135;
-constexpr lv_coord_t kBarW = 8;
-constexpr lv_coord_t kBarGap = 3;
+constexpr lv_coord_t kBarW = 7;
+constexpr lv_coord_t kBarGap = 2;
 constexpr lv_coord_t kPlotTop = 62;
 constexpr lv_coord_t kPlotH = 48;
+constexpr int kVisSamples = 512;
+constexpr int kBandCount = 24;
 
 // Plain HTTP MPEG1 Layer III only. No HLS, no TS, no TLS: mbedtls' handshake needs
 // ~8-10KB of the *calling task's* stack, which is what a no-PSRAM S3 cannot spare
@@ -97,6 +99,8 @@ struct StreamCtx {
     uint32_t sample_rate = 0;
     uint8_t channels = 0;
     float ema_level = 0.0f;
+    int16_t vis_buf[kVisSamples];
+    int vis_fill = 0;
     uint32_t pcm_chunks = 0;
     uint32_t bytes_in = 0;
     uint32_t frames_ok = 0;
@@ -106,6 +110,53 @@ struct StreamCtx {
     bool format_rejected = false;
     double resample_pos = 0.0;
 };
+
+void PushVisSample(StreamCtx* ctx, int16_t sample) {
+    if (ctx == nullptr || ctx->vis_fill >= kVisSamples) {
+        return;
+    }
+    ctx->vis_buf[ctx->vis_fill++] = sample;
+}
+
+void NotifyBandsFromPcm(RadioPage* page, const int16_t* samples, int count) {
+    if (page == nullptr || samples == nullptr || count <= 0) {
+        return;
+    }
+    const int seg = count / kBandCount;
+    if (seg <= 0) {
+        return;
+    }
+
+    float energies[kBandCount];
+    for (int b = 0; b < kBandCount; ++b) {
+        double sum = 0;
+        double diff_sum = 0;
+        int16_t prev = 0;
+        const int start = b * seg;
+        const int end = (b == kBandCount - 1) ? count : (start + seg);
+        for (int i = start; i < end; ++i) {
+            const int16_t s = samples[i];
+            sum += static_cast<double>(s) * static_cast<double>(s);
+            const int d = static_cast<int>(s) - static_cast<int>(prev);
+            diff_sum += static_cast<double>(d) * static_cast<double>(d);
+            prev = s;
+        }
+        const int n = end - start;
+        const float rms = static_cast<float>(std::sqrt(sum / n));
+        const float hif = static_cast<float>(std::sqrt(diff_sum / n));
+        const float w = 0.55f + 0.45f * (static_cast<float>(b) / (kBandCount - 1));
+        energies[b] = rms * (1.0f - w) + hif * w;
+    }
+    page->NotifyBandLevels(energies, kBandCount);
+}
+
+void FlushVisBuffer(StreamCtx* ctx) {
+    if (ctx == nullptr || ctx->vis_fill <= 0 || ctx->page == nullptr) {
+        return;
+    }
+    NotifyBandsFromPcm(ctx->page, ctx->vis_buf, ctx->vis_fill);
+    ctx->vis_fill = 0;
+}
 
 void FeedPcmToSpeaker(StreamCtx* ctx, const uint8_t* data, uint32_t bytes) {
     if (data == nullptr || bytes < 4 || ctx == nullptr || ctx->page == nullptr) {
@@ -182,8 +233,10 @@ void FeedPcmToSpeaker(StreamCtx* ctx, const uint8_t* data, uint32_t bytes) {
         } else {
             sample = in[i];
         }
-        out[n_out++] = static_cast<int16_t>(sample);
-        energy += static_cast<double>(sample) * static_cast<double>(sample);
+        const int16_t mono = static_cast<int16_t>(sample);
+        out[n_out++] = mono;
+        PushVisSample(ctx, mono);
+        energy += static_cast<double>(mono) * static_cast<double>(mono);
         ++energy_n;
         ctx->resample_pos = pos + step;
         if (n_out == kResampleChunk) {
@@ -214,9 +267,12 @@ void FeedPcmToSpeaker(StreamCtx* ctx, const uint8_t* data, uint32_t bytes) {
                      (unsigned)uxTaskGetStackHighWaterMark(nullptr));
         }
     }
+    if (ctx->vis_fill >= kVisSamples) {
+        FlushVisBuffer(ctx);
+    }
     if (energy_n > 0) {
         const float rms = static_cast<float>(std::sqrt(energy / energy_n) / 32768.0);
-        ctx->ema_level = ctx->ema_level * 0.7f + rms * 0.3f;
+        ctx->ema_level = ctx->ema_level * 0.6f + rms * 0.4f;
         ctx->page->NotifyLevel(ctx->ema_level);
     }
 }
@@ -547,6 +603,39 @@ void RadioPage::NotifyLevel(float level) {
     level_.store(level);
 }
 
+void RadioPage::NotifyBandLevels(const float* energies, int count) {
+    if (energies == nullptr || count != kBarCount) {
+        return;
+    }
+
+    float max_e = 0.001f;
+    for (int b = 0; b < kBarCount; ++b) {
+        if (energies[b] > max_e) {
+            max_e = energies[b];
+        }
+    }
+    if (max_e > band_peak_) {
+        band_peak_ = max_e;
+    } else {
+        band_peak_ = band_peak_ * 0.92f + max_e * 0.08f;
+    }
+    if (band_peak_ < 80.0f) {
+        band_peak_ = 80.0f;
+    }
+
+    for (int b = 0; b < kBarCount; ++b) {
+        float target = energies[b] / band_peak_;
+        if (target > 1.0f) {
+            target = 1.0f;
+        }
+        if (target > band_levels_[b]) {
+            band_levels_[b] = band_levels_[b] * 0.35f + target * 0.65f;
+        } else {
+            band_levels_[b] = band_levels_[b] * 0.75f + target * 0.25f;
+        }
+    }
+}
+
 void RadioPage::NotifyPlaying() {
     if (!user_paused_.load()) {
         play_state_.store(RadioPlayState::Playing);
@@ -607,12 +696,21 @@ void RadioPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     const int plot_w = kBarCount * (kBarW + kBarGap) - kBarGap;
     const int plot_x = (kScreenW - plot_w) / 2;
     for (int i = 0; i < kBarCount; ++i) {
+        const int x = plot_x + i * (kBarW + kBarGap);
+        lv_obj_t* grid = lv_obj_create(panel_);
+        StripStyles(grid);
+        lv_obj_set_size(grid, 1, kPlotH);
+        lv_obj_set_pos(grid, x + kBarW / 2, kPlotTop);
+        lv_obj_set_style_bg_color(grid, lv_color_hex(0x222222), 0);
+        lv_obj_set_style_bg_opa(grid, LV_OPA_COVER, 0);
+
         bars_[i] = lv_obj_create(panel_);
         StripStyles(bars_[i]);
         lv_obj_set_size(bars_[i], kBarW, 2);
-        lv_obj_set_pos(bars_[i], plot_x + i * (kBarW + kBarGap), kPlotTop + kPlotH - 2);
-        lv_obj_set_style_bg_color(bars_[i], lv_color_hex(0x00FF66), 0);
+        lv_obj_set_pos(bars_[i], x, kPlotTop + kPlotH - 2);
+        lv_obj_set_style_bg_color(bars_[i], lv_color_hex(0x00FFFF), 0);
         lv_obj_set_style_bg_opa(bars_[i], LV_OPA_COVER, 0);
+        band_levels_[i] = 0;
     }
 
     lv_obj_t* hint = lv_label_create(panel_);
@@ -788,6 +886,10 @@ void RadioPage::StartStream() {
     user_paused_.store(false);
     play_state_.store(RadioPlayState::Connecting);
     level_.store(0.0f);
+    band_peak_ = 200.0f;
+    for (int i = 0; i < kBarCount; ++i) {
+        band_levels_[i] = 0.0f;
+    }
     SetStatusHint("connecting");
 
     const BaseType_t ok = xTaskCreatePinnedToCore(StreamTask, "radio_stream", kTaskStack, this,
@@ -822,6 +924,10 @@ void RadioPage::StopStream() {
     stream_task_ = nullptr;
     play_state_.store(RadioPlayState::Idle);
     level_.store(0.0f);
+    band_peak_ = 200.0f;
+    for (int i = 0; i < kBarCount; ++i) {
+        band_levels_[i] = 0.0f;
+    }
     ReleaseAudioExclusive();
     ESP_LOGI(TAG, "StopStream end heap=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -866,7 +972,6 @@ void RadioPage::UpdateUi(CardputerAdvCarLcdDisplay* display) {
     }
 
     const RadioPlayState st = play_state_.load();
-    const float lvl = level_.load();
     int st_idx = station_index_.load();
     if (st_idx < 0 || st_idx >= kStationCount) {
         st_idx = 0;
@@ -937,26 +1042,34 @@ void RadioPage::UpdateUi(CardputerAdvCarLcdDisplay* display) {
         }
     }
 
+    if (st != RadioPlayState::Playing) {
+        for (int b = 0; b < kBarCount; ++b) {
+            band_levels_[b] *= 0.85f;
+        }
+    }
+
     const int plot_w = kBarCount * (kBarW + kBarGap) - kBarGap;
     const int plot_x = (kScreenW - plot_w) / 2;
     for (int i = 0; i < kBarCount; ++i) {
         if (bars_[i] == nullptr) {
             continue;
         }
-        float wave = lvl * (0.55f + 0.45f * std::sin(lvl * 12.0f + i * 0.7f));
-        if (st != RadioPlayState::Playing) {
-            wave *= 0.15f;
-        }
-        int h = static_cast<int>(wave * (kPlotH - 2));
+        int h = static_cast<int>(band_levels_[i] * (kPlotH - 2));
         if (h < 2) {
             h = 2;
         }
         if (h > kPlotH) {
             h = kPlotH;
         }
+        const int x = plot_x + i * (kBarW + kBarGap);
         lv_obj_set_size(bars_[i], kBarW, h);
-        lv_obj_set_pos(bars_[i], plot_x + i * (kBarW + kBarGap), kPlotTop + kPlotH - h);
-        lv_obj_set_style_bg_color(bars_[i], lv_color_hex((i % 5 == 0) ? 0x00FFFF : 0x00FF66), 0);
+        lv_obj_set_pos(bars_[i], x, kPlotTop + kPlotH - h);
+
+        uint32_t color = (i == 19) ? 0x22C55E : 0x00FFFF;
+        if (band_levels_[i] > 0.85f && (i % 11 == 3)) {
+            color = 0x22C55E;
+        }
+        lv_obj_set_style_bg_color(bars_[i], lv_color_hex(color), 0);
     }
 }
 
@@ -966,6 +1079,10 @@ void RadioPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     }
     display_ = display;
     active_ = true;
+    band_peak_ = 200.0f;
+    for (int i = 0; i < kBarCount; ++i) {
+        band_levels_[i] = 0.0f;
+    }
     if (station_index_.load() < 0 || station_index_.load() >= kStationCount) {
         station_index_.store(kDefaultStation);
     }
