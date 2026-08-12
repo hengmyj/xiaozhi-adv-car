@@ -139,6 +139,10 @@ public:
     void ReleaseAudioModels();
     void RestoreAudioModels();
     bool AudioModelsReleased() const { return models_released_; }
+    bool HasOpusEncoder() const { return opus_encoder_ != nullptr; }
+    bool HasOpusDecoder() const { return opus_decoder_ != nullptr; }
+    bool IsExternalPlaybackActive() const { return external_playback_active_; }
+    const DebugStatistics& GetDebugStatistics() const { return debug_statistics_; }
 
     // Direct codec playback (e.g. Radio HLS): hold ES8311 TX so power-save cannot mute.
     void SetExternalPlaybackActive(bool active);

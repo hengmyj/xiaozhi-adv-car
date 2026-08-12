@@ -9,6 +9,10 @@ void NoAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srmo
     output_buffer_.reserve(frame_samples_);
 }
 
+void NoAudioProcessor::Deinitialize() {
+    Stop();
+}
+
 void NoAudioProcessor::Feed(std::vector<int16_t>&& data) {
     if (!is_running_ || !output_callback_) {
         return;

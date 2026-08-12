@@ -907,10 +907,8 @@ void RadioPage::ReleaseAudioExclusive() {
     audio_exclusive_ = false;
     auto& audio = Application::GetInstance().GetAudioService();
     audio.SetExternalPlaybackActive(false);
-    auto* codec = Board::GetInstance().GetAudioCodec();
-    if (codec != nullptr) {
-        codec->EnableInput(false);
-    }
+    // Do not EnableInput(false) here: a deferred StopStream join can run AFTER
+    // Chat already restored the mic, which would leave listening with no PCM.
     ESP_LOGI(TAG, "audio exclusive OFF (models deferred) heap=%u largest=%u",
              (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest());
 }

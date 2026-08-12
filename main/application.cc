@@ -1124,19 +1124,59 @@ void Application::RestoreAudioRouting() {
     // can manage ES8311 again. Rebuild Opus only after an exclusive page
     // Release — boot Initialize must not call this (codec_ still null).
     // Called from PageManager::ScheduleChatAudioRestore after Chat is visible.
+    DeviceState state = GetDeviceState();
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    ESP_LOGI(TAG,
+             "RestoreAudioRouting begin state=%d released=%d enc=%d dec=%d ext=%d in=%d out=%d vp=%d",
+             static_cast<int>(state), audio_service_.AudioModelsReleased() ? 1 : 0,
+             audio_service_.HasOpusEncoder() ? 1 : 0, audio_service_.HasOpusDecoder() ? 1 : 0,
+             audio_service_.IsExternalPlaybackActive() ? 1 : 0,
+             codec != nullptr && codec->input_enabled() ? 1 : 0,
+             codec != nullptr && codec->output_enabled() ? 1 : 0,
+             audio_service_.IsAudioProcessorRunning() ? 1 : 0);
+
     audio_service_.SetExternalPlaybackActive(false);
-    if (audio_service_.AudioModelsReleased()) {
+    const bool was_released = audio_service_.AudioModelsReleased();
+    const bool need_recycle =
+        codec != nullptr &&
+        (was_released || !codec->input_enabled() || !codec->output_enabled());
+    if (need_recycle) {
+        // Recycle BEFORE rebuilding Opus so esp_codec_dev_new gets a contiguous
+        // block. Radio played TX without reading RX; EnableInput(true) would
+        // reuse the same IN_OUT handle whose RX DMA overflowed, so Read stalls
+        // and Chat stays in listening.
+        codec->RecycleDevice();
+    }
+
+    if (was_released || !audio_service_.HasOpusEncoder() || !audio_service_.HasOpusDecoder()) {
         audio_service_.RestoreAudioModels();
     }
 
-    DeviceState state = GetDeviceState();
+    if (codec != nullptr) {
+        if (!codec->input_enabled()) {
+            codec->EnableInput(true);
+        }
+        if (!codec->output_enabled()) {
+            codec->EnableOutput(true);
+        }
+        int vol = codec->output_volume();
+        if (vol <= 0) {
+            codec->SetOutputVolume(70);
+            vol = 70;
+        }
+        ESP_LOGI(TAG, "RestoreAudioRouting codec in=%d out=%d vol=%d enc=%d dec=%d",
+                 codec->input_enabled() ? 1 : 0, codec->output_enabled() ? 1 : 0, vol,
+                 audio_service_.HasOpusEncoder() ? 1 : 0, audio_service_.HasOpusDecoder() ? 1 : 0);
+    } else {
+        ESP_LOGW(TAG, "RestoreAudioRouting state=%d (no codec)", static_cast<int>(state));
+    }
+
     switch (state) {
         case kDeviceStateStarting:
         case kDeviceStateActivating:
         case kDeviceStateUpgrading:
         case kDeviceStateFatalError:
         case kDeviceStateConnecting:
-            // Not ready / transitional — only clear exclusive hold.
             break;
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
@@ -1144,9 +1184,9 @@ void Application::RestoreAudioRouting() {
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateListening:
-            if (!audio_service_.IsAudioProcessorRunning()) {
-                audio_service_.EnableVoiceProcessing(true);
-            }
+            // Always restart VP after Radio: the running bit may be stale, and
+            // this board has no AFE/VAD — uplink is raw PCM → Opus encoder.
+            audio_service_.EnableVoiceProcessing(true);
 #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
             audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
 #else
@@ -1158,7 +1198,6 @@ void Application::RestoreAudioRouting() {
                 audio_service_.EnableVoiceProcessing(false);
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
-            // Do not ResetDecoder here — would kill in-flight TTS.
             break;
         case kDeviceStateWifiConfiguring:
         case kDeviceStateAudioTesting:
@@ -1169,22 +1208,16 @@ void Application::RestoreAudioRouting() {
             break;
     }
 
-    auto* codec = Board::GetInstance().GetAudioCodec();
-    if (codec != nullptr) {
-        int vol = codec->output_volume();
-        if (vol <= 0) {
-            codec->SetOutputVolume(70);
-            vol = 70;
-        }
-        ESP_LOGI(TAG,
-                 "RestoreAudioRouting state=%d vol=%d out=%d in=%d ww=%d vp=%d",
-                 static_cast<int>(state), vol, codec->output_enabled() ? 1 : 0,
-                 codec->input_enabled() ? 1 : 0,
-                 audio_service_.IsWakeWordRunning() ? 1 : 0,
-                 audio_service_.IsAudioProcessorRunning() ? 1 : 0);
-    } else {
-        ESP_LOGW(TAG, "RestoreAudioRouting state=%d (no codec)", static_cast<int>(state));
-    }
+    const auto& stats = audio_service_.GetDebugStatistics();
+    ESP_LOGI(TAG,
+             "RestoreAudioRouting done state=%d enc=%d dec=%d in=%d out=%d ww=%d vp=%d in_cnt=%u enc_cnt=%u",
+             static_cast<int>(GetDeviceState()), audio_service_.HasOpusEncoder() ? 1 : 0,
+             audio_service_.HasOpusDecoder() ? 1 : 0,
+             codec != nullptr && codec->input_enabled() ? 1 : 0,
+             codec != nullptr && codec->output_enabled() ? 1 : 0,
+             audio_service_.IsWakeWordRunning() ? 1 : 0,
+             audio_service_.IsAudioProcessorRunning() ? 1 : 0, stats.input_count,
+             stats.encode_count);
 }
 
 void Application::HandleStateChangedEvent() {
@@ -1214,6 +1247,14 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
+            if (audio_service_.AudioModelsReleased() || !audio_service_.HasOpusEncoder()) {
+                ESP_LOGW(TAG, "listening with opus missing released=%d enc=%d dec=%d — Restore",
+                         audio_service_.AudioModelsReleased() ? 1 : 0,
+                         audio_service_.HasOpusEncoder() ? 1 : 0,
+                         audio_service_.HasOpusDecoder() ? 1 : 0);
+                audio_service_.RestoreAudioModels();
+            }
+
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
                 // For auto mode, wait for playback queue to be empty before enabling voice processing
@@ -1234,6 +1275,19 @@ void Application::HandleStateChangedEvent() {
             // Disable wake word detection in listening mode
             audio_service_.EnableWakeWordDetection(false);
 #endif
+
+            {
+                auto* codec = board.GetAudioCodec();
+                const auto& stats = audio_service_.GetDebugStatistics();
+                ESP_LOGI(TAG,
+                         "listening: enc=%d dec=%d in=%d out=%d vp=%d in_cnt=%u enc_cnt=%u",
+                         audio_service_.HasOpusEncoder() ? 1 : 0,
+                         audio_service_.HasOpusDecoder() ? 1 : 0,
+                         codec != nullptr && codec->input_enabled() ? 1 : 0,
+                         codec != nullptr && codec->output_enabled() ? 1 : 0,
+                         audio_service_.IsAudioProcessorRunning() ? 1 : 0, stats.input_count,
+                         stats.encode_count);
+            }
             
             // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
             if (play_popup_on_listening_) {

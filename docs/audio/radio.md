@@ -147,23 +147,36 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 
 串口应能看到：`OnLeave` → `audio exclusive OFF (models deferred)` →（Car/Music 无 Opus restore）→ 再进 `OnEnter` → `released audio models`（常为 enc=0 dec=0）→ `mp3 decoder open ok` → `self-test tone` → `pcm chunks=…`。Fn+1 回 Chat：`ShowPage leave … ok` → `Chat audio restore done` + `restored audio models` + `RestoreAudioRouting`。
 
-### Radio → Fn+1 Chat 听不到说话
+### Radio → Fn+1 Chat 卡在「聆听中」
 
 #### 现象
 
-Radio 能播；**Fn+1 完全回到 Chat 后再说话**，小智 TTS 无声（麦克风路径同样哑）。
+Radio 能播；**Fn+1 回到 Chat 后按 Enter 说话**，状态栏一直「聆听中」，听不到自己、也收不到回复。开机不黑屏；Radio 仍应能播。
 
-#### 根因
+#### 根因（两层，7bd1afb 只修了第一层）
 
-进 Radio 会 `ReleaseAudioModels` 关掉 Opus 编/解码器（约 43KB）。`OpusCodecTask` 在 `opus_decoder_ == nullptr` 时直接跳过解码，TTS 包被吃掉但不播。旧代码把 Restore 声明在 `ScheduleChatAudioRestore`，但函数未实现、Chat `OnEnter` 也不再 Restore，回 Chat 后解码器一直是空的。若在 Radio `OnLeave` 立刻 Restore，又会和独占页互切抢堆；若开机 `Initialize` 走 Chat `OnEnter` Restore，此时 `codec_` 仍为 null，会黑屏复位。
+1. **Opus 编/解码器被 Radio `ReleaseAudioModels` 关掉**（约 43KB）。本板 `CONFIG_WAKE_WORD_DISABLED=y`，无 AFE/VAD，聆听靠按键进入，上行是 PCM → **encoder** → 服务器。只 Restore decoder 或 Restore 被丢掉时，包发不出去，服务器不回 TTS，UI 一直聆听。
+2. **ES8311 RX DMA 在 Radio 期间饿死**：Radio 只 `Write` PCM、`EnableInput(false)`，但 IN_OUT 句柄因喇叭仍开而不 delete。`EnableInput(true)` 复用旧句柄后 `esp_codec_dev_read` 卡住或读到空数据。7bd1afb 的 `ScheduleChatAudioRestore` 若因 `IsChatUiVisible` 失败会**永久丢掉** Restore；`StopStream` 超时后的 deferred leave 还会再 `EnableInput(false)` 把麦关掉。
 
 #### 修复
 
-- Radio/Music Leave：`StopStream` / 关 exclusive / `DestroyPanel`，**不** `RestoreAudioModels`
-- `ShowPage(Chat)` 成功（或 `RecoverToChat` 回到 Chat）且 `switching_ = false`、Chat UI 可见后，`Application::Schedule` 下一拍再 Restore
-- 回调里再确认仍在 Chat、UI 可见、`codec_ != nullptr`；仅 `AudioModelsReleased()` 时重建 Opus，然后 `RestoreAudioRouting` + `EnableInput(true)`
+- Radio/Music Leave：**不** `RestoreAudioModels`；`ReleaseAudioExclusive` **不再** `EnableInput(false)`（避免晚到的 join 把 Chat 的麦关掉）
+- `ShowPage(Chat)` 完成后 `ScheduleChatAudioRestore`：Chat UI 不可见时仍 Restore（只告警）；`switching_` 时最多再 defer 2 次
+- `RestoreAudioRouting`：**先** `RecycleDevice`（close+delete + I2S disable + 再 open）**再** 成对重建 encoder+decoder，然后按 DeviceState 重绑 VP
+- 进入 listening 时若 encoder 仍空，再补一次 Restore；`EnableVoiceProcessing(true)` 同样会补
 
-串口对照：`ShowPage leave 9 -> 1 ok` → `restored audio models enc=1 dec=1` → `RestoreAudioRouting` → `Chat audio restore done`。随后说话应有 TTS 播放。
+串口对照（成功）：
+
+```
+ShowPage leave 9 -> 1 ok
+Chat audio restore run state=... released=1 enc=0 dec=0
+RecycleDevice done dev=0x... in=1 out=1
+restored audio models enc=0x... dec=0x... enc_ok=1 dec_ok=1 released=0
+RestoreAudioRouting done state=... enc=1 dec=1 in=1 out=1 vp=0
+Chat audio restore done ... enc=1 dec=1 in=1 out=1
+```
+
+按 Enter 后应有 `listening: enc=1 dec=1 in=1 ... vp=1`，随后 `in_cnt` / `enc_cnt` 增加。若停在聆听：查是否出现 `Chat audio restore dropped`、`failed to re-open opus encoder`、`EnableVoiceProcessing: opus missing`、`Failed to encode audio: encoder not configured`。
 
 ### Music → Launcher → Radio 仍无声
 
@@ -257,6 +270,6 @@ Car/IceBox 的 hidden 仪表盘才是 1–4→Radio 的主因；Clock/Matrix 对
 ## 遗留项
 
 - 稳定态仅剩 **15-20KB** 内部 SRAM，余量不宽裕。
-- 「进 Radio 再 Fn+1 回 Chat 说话」依赖 `ShowPage(Chat)` 完成后的 `ScheduleChatAudioRestore`（独占页 Leave 不重建 Opus）；二次进 Radio 见上文「进出页二次进入无声」。
+- 「进 Radio 再 Fn+1 回 Chat 说话」依赖 `ScheduleChatAudioRestore`：`RecycleDevice` + 成对重建 Opus encoder/decoder（独占页 Leave 不重建）；二次进 Radio 见上文「进出页二次进入无声」。
 - 目前只验证 Music 台 `http://lhttp.qtfm.cn/live/332/64k.mp3`；News 台未逐项确认。
 - 24kHz 最近邻重采样高频有混叠，音质一般但可用。

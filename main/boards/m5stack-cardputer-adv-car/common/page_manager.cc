@@ -156,18 +156,29 @@ void PageManager::RecoverToChat(const char* reason) {
     }
 }
 
-void PageManager::ScheduleChatAudioRestore() {
+void PageManager::ScheduleChatAudioRestore(int retry) {
     // Next main-loop tick: ShowPage has returned, switching_ is already false,
     // Chat UI is on screen. Never call from Radio/Music OnLeave or Initialize.
-    Application::GetInstance().Schedule([this]() {
-        if (switching_ || current_ != PageId::Chat) {
-            ESP_LOGW(TAG, "Chat audio restore dropped switching=%d page=%d",
-                     switching_ ? 1 : 0, static_cast<int>(current_));
+    Application::GetInstance().Schedule([this, retry]() {
+        if (switching_) {
+            if (retry < 2) {
+                ESP_LOGW(TAG, "Chat audio restore deferred switching retry=%d", retry);
+                ScheduleChatAudioRestore(retry + 1);
+            } else {
+                ESP_LOGE(TAG, "Chat audio restore dropped: still switching page=%d",
+                         static_cast<int>(current_));
+            }
+            return;
+        }
+        if (current_ != PageId::Chat) {
+            ESP_LOGW(TAG, "Chat audio restore dropped page=%d", static_cast<int>(current_));
             return;
         }
         if (display_ == nullptr || !display_->IsChatUiVisible()) {
-            ESP_LOGW(TAG, "Chat audio restore dropped: Chat UI not visible");
-            return;
+            ESP_LOGW(TAG, "Chat audio restore: Chat UI not visible, restoring audio anyway");
+            if (display_ != nullptr) {
+                display_->ShowChatUi();
+            }
         }
         auto& app = Application::GetInstance();
         auto& audio = app.GetAudioService();
@@ -176,20 +187,28 @@ void PageManager::ScheduleChatAudioRestore() {
             ESP_LOGW(TAG, "Chat audio restore skipped: codec null");
             return;
         }
-        if (audio.AudioModelsReleased()) {
-            audio.RestoreAudioModels();
-        } else {
-            ESP_LOGI(TAG, "Chat audio restore: models still resident, routing only");
-        }
+        ESP_LOGI(TAG,
+                 "Chat audio restore run state=%d released=%d enc=%d dec=%d ext=%d in=%d out=%d",
+                 static_cast<int>(app.GetDeviceState()), audio.AudioModelsReleased() ? 1 : 0,
+                 audio.HasOpusEncoder() ? 1 : 0, audio.HasOpusDecoder() ? 1 : 0,
+                 audio.IsExternalPlaybackActive() ? 1 : 0, codec->input_enabled() ? 1 : 0,
+                 codec->output_enabled() ? 1 : 0);
         app.RestoreAudioRouting();
-        codec->EnableInput(true);
+        if (!codec->input_enabled()) {
+            codec->EnableInput(true);
+        }
         if (!codec->output_enabled()) {
             codec->EnableOutput(true);
         }
-        ESP_LOGI(TAG, "Chat audio restore done heap=%u largest=%u in=%d out=%d ww=%d vp=%d",
+        const auto& stats = audio.GetDebugStatistics();
+        ESP_LOGI(TAG,
+                 "Chat audio restore done heap=%u largest=%u in=%d out=%d enc=%d dec=%d ww=%d vp=%d "
+                 "in_cnt=%u enc_cnt=%u",
                  static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()),
                  codec->input_enabled() ? 1 : 0, codec->output_enabled() ? 1 : 0,
-                 audio.IsWakeWordRunning() ? 1 : 0, audio.IsAudioProcessorRunning() ? 1 : 0);
+                 audio.HasOpusEncoder() ? 1 : 0, audio.HasOpusDecoder() ? 1 : 0,
+                 audio.IsWakeWordRunning() ? 1 : 0, audio.IsAudioProcessorRunning() ? 1 : 0,
+                 stats.input_count, stats.encode_count);
     });
 }
 

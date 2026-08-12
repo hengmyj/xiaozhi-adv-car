@@ -1,5 +1,6 @@
 #include "es8311_audio_codec.h"
 
+#include <driver/i2s_common.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 
@@ -176,6 +177,37 @@ void Es8311AudioCodec::SetOutputVolume(int volume) {
         ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(dev_, volume));
     }
     AudioCodec::SetOutputVolume(volume);
+}
+
+void Es8311AudioCodec::RecycleDevice() {
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    ESP_LOGI(TAG, "RecycleDevice begin dev=%p in=%d out=%d heap=%u largest=%u",
+             dev_, input_enabled_ ? 1 : 0, output_enabled_ ? 1 : 0,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (dev_ != nullptr) {
+        esp_codec_dev_close(dev_);
+        esp_codec_dev_delete(dev_);
+        dev_ = nullptr;
+    }
+    auto disable_ch = [](i2s_chan_handle_t handle, const char* name) {
+        if (handle == nullptr) {
+            return;
+        }
+        esp_err_t err = i2s_channel_disable(handle);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "RecycleDevice disable %s: %s", name, esp_err_to_name(err));
+        }
+    };
+    disable_ch(tx_handle_, "tx");
+    disable_ch(rx_handle_, "rx");
+    input_enabled_ = true;
+    output_enabled_ = true;
+    UpdateDeviceState();
+    ESP_LOGI(TAG, "RecycleDevice done dev=%p in=%d out=%d heap=%u largest=%u",
+             dev_, input_enabled_ ? 1 : 0, output_enabled_ ? 1 : 0,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void Es8311AudioCodec::EnableInput(bool enable) {

@@ -578,9 +578,19 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 
 void AudioService::EnableVoiceProcessing(bool enable) {
     if (audio_processor_ == nullptr || codec_ == nullptr) {
+        ESP_LOGW(TAG, "EnableVoiceProcessing(%d) skipped processor=%p codec=%p",
+                 enable ? 1 : 0, audio_processor_.get(), codec_);
         return;
     }
-    ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
+    if (enable && (models_released_ || opus_encoder_ == nullptr)) {
+        ESP_LOGW(TAG, "EnableVoiceProcessing: opus missing released=%d enc=%p dec=%p — Restore first",
+                 models_released_ ? 1 : 0, opus_encoder_, opus_decoder_);
+        RestoreAudioModels();
+    }
+    ESP_LOGI(TAG, "%s voice processing init=%d running=%d enc=%p dec=%p in=%d",
+             enable ? "Enabling" : "Disabling", audio_processor_initialized_ ? 1 : 0,
+             IsAudioProcessorRunning() ? 1 : 0, opus_encoder_, opus_decoder_,
+             codec_->input_enabled() ? 1 : 0);
     if (enable) {
         if (!audio_processor_initialized_) {
             audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
@@ -703,9 +713,9 @@ void AudioService::RestoreAudioModels() {
     if (enc_ok && dec_ok) {
         models_released_ = false;
     }
-    ESP_LOGI(TAG, "restored audio models enc=%d dec=%d heap %u -> %u largest=%u", enc_ok ? 1 : 0,
-             dec_ok ? 1 : 0, (unsigned)before,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+    ESP_LOGI(TAG, "restored audio models enc=%p dec=%p enc_ok=%d dec_ok=%d released=%d heap %u -> %u largest=%u",
+             opus_encoder_, opus_decoder_, enc_ok ? 1 : 0, dec_ok ? 1 : 0, models_released_ ? 1 : 0,
+             (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
