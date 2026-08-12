@@ -114,9 +114,37 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 - 控制台必须保持开启（`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` + `LOG_DEFAULT_LEVEL_INFO`）：早期 `CONFIG_ESP_CONSOLE_NONE=y` 使 panic handler 无处输出，重启循环里连 backtrace 都看不到。配合 `ESP_SYSTEM_PANIC_PRINT_REBOOT` 与 5 秒延迟，让 USB-CDC 有时间冲出 backtrace。
 - 改分区表后需整包烧录：`./flash.sh`，串口另开 `./monitor.sh`（见 [build/flash.md](../build/flash.md)）。
 
+## 进出页二次进入无声
+
+### 现象
+
+- 开机直接进 Radio → 可播放
+- 离开 Radio 再进（任意中间页）→ 无声 / 一直 connecting / `low memory`
+
+### 根因
+
+无 PSRAM 板上 MP3 解码器与 Opus 不能同时常驻。旧实现里 `StopStream` 在 `esp_http_client` 阻塞（open/read，超时 6s）时只等 **4s** 就：
+
+1. 把 `stream_task_` 置空（任务实际还活着）
+2. `ReleaseAudioExclusive` → `RestoreAudioModels()` 重建 Opus（~43KB）
+
+僵尸 `StreamTask` 仍占着 MP3 解码器与 HTTP 缓冲。再次进页时 `ReleaseAudioModels` 即使再次释放 Opus，堆也已被碎片/双占用吃掉，解码器开不起来或开流被拒。
+
+次要问题：`OnEnter` 的 `Schedule(StartStream)` 仅看 `active_`，快切页时旧回调可能在新一次进入后误触发/乱序。
+
+### 修复（`fix/radio-reenter-audio`）
+
+- `AbortActiveHttp()`：离页时 `esp_http_client_close` 打断阻塞，尽快 join
+- join 上限改为 `kHttpTimeoutMs + 2000`；**超时绝不提前 Restore Opus**，也不清空未退出的 `stream_task_`
+- `enter_gen_`：作废离开前排队的 `StartStream`
+- `StartStream` 若发现上一次任务未死，先 drain 再 `CaptureAudioExclusive`
+- `CaptureAudioExclusive` 每次都重新 `ReleaseAudioModels`（幂等），并打 free/largest 堆日志
+
+串口应能看到：`OnLeave` → `AbortActiveHttp` / `WaitStreamExit` → `audio exclusive OFF` → 再进 `OnEnter gen=…` → `released audio models` → `mp3 decoder open ok` → `pcm chunks=…`。
+
 ## 遗留项
 
 - 稳定态仅剩 **15-20KB** 内部 SRAM，余量不宽裕。
-- 「进 Radio 到离页再聊天语音」的往返**未实测**（Opus 是离页才重建）。
+- 「进 Radio 到离页再聊天语音」依赖离页 `RestoreAudioModels`；二次进 Radio 见上文「进出页二次进入无声」。
 - 目前只验证 Music 台 `http://lhttp.qtfm.cn/live/332/64k.mp3`；News 台未逐项确认。
 - 24kHz 最近邻重采样高频有混叠，音质一般但可用。
