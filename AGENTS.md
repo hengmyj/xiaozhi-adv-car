@@ -9,8 +9,8 @@ Cardputer ADV 小智 fork + 多页启动器。
 - 启动器/机载 UI 在 CJK 会乱码处用 ASCII 标签（如 Car / SpiderBot / IceBox）
 - Cardputer ADV 页面：Fn 仅用于切页；页内车控/IR 键无需 Fn；红外按键即时发码（无需 Enter）
 - Cardputer 已有键盘：配网优先机上扫列表+输密码，勿默认依赖 SoftAP/手机网页配网
-- `./flash.sh` + `./monitor.sh`（Radio 改 8m 分区表需整包烧录）；卡住监视器用 `./monitor.sh kill` 或 Ctrl+]
-- `./monitor.sh` 必须在 Cursor 本机终端跑（idf_monitor 要 TTY）；Agent 无 TTY 会直接拒绝，勿在对话里硬跑。包装脚本不可用 stdin heredoc（会把 TTY 变成管道）
+- `./flash.sh` + `./monitor.sh`（Radio 改 8m 分区表需整包烧录）；卡住监视器用 `./monitor.sh kill` 或 Ctrl+C
+- `./monitor.sh` 用 openpty() 给 idf_monitor 真 PTY（Cursor 集成终端也能看日志，不依赖 stdin 的 tcgetattr）；Ctrl+C 结束；idf_monitor 立刻失败则 pyserial 只读降级。包装脚本用 fd 3 heredoc，勿把 stdin 变成管道
 - 不宜 ESP-Brookesia；构建 ESP-IDF ≥5.4（`~/.espressif/v5.5.3/esp-idf`）
 
 ## Learned Workspace Facts
