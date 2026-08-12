@@ -547,7 +547,7 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
 }
 
 void AudioService::EnableWakeWordDetection(bool enable) {
-    if (!wake_word_) {
+    if (!wake_word_ || codec_ == nullptr) {
         return;
     }
 
@@ -577,6 +577,9 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {
+    if (audio_processor_ == nullptr || codec_ == nullptr) {
+        return;
+    }
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
     if (enable) {
         if (!audio_processor_initialized_) {
@@ -647,6 +650,7 @@ void AudioService::ReleaseAudioModels() {
         esp_opus_dec_close(opus_decoder_);
         opus_decoder_ = nullptr;
     }
+    models_released_ = true;
     ESP_LOGI(TAG,
              "released audio models: heap %u -> %u largest %u -> %u (ww=%d ap=%d enc=%d dec=%d)",
              (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -656,6 +660,14 @@ void AudioService::ReleaseAudioModels() {
 }
 
 void AudioService::RestoreAudioModels() {
+    if (codec_ == nullptr) {
+        ESP_LOGW(TAG, "RestoreAudioModels skipped: codec not initialized");
+        return;
+    }
+    if (!models_released_) {
+        ESP_LOGD(TAG, "RestoreAudioModels skipped: models still resident");
+        return;
+    }
     size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     bool dec_ok = opus_decoder_ != nullptr;
     bool enc_ok = opus_encoder_ != nullptr;
@@ -687,6 +699,9 @@ void AudioService::RestoreAudioModels() {
             encoder_frame_size_ = encoder_frame_size_ / sizeof(int16_t);
             enc_ok = true;
         }
+    }
+    if (enc_ok && dec_ok) {
+        models_released_ = false;
     }
     ESP_LOGI(TAG, "restored audio models enc=%d dec=%d heap %u -> %u largest=%u", enc_ok ? 1 : 0,
              dec_ok ? 1 : 0, (unsigned)before,

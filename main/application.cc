@@ -1121,11 +1121,12 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::RestoreAudioRouting() {
     // Drop any exclusive hold (Radio direct OutputData) so power-save + TTS
-    // can manage ES8311 again. Rebuild Opus here — exclusive pages (Radio/Music)
-    // deliberately leave models released so Radio↔Car/Music does not pay a
-    // Restore→Release heap thrash that fragments the no-PSRAM SRAM.
+    // can manage ES8311 again. Rebuild Opus only after an exclusive page
+    // Release — boot Chat OnEnter must not Restore (codec_ still null).
     audio_service_.SetExternalPlaybackActive(false);
-    audio_service_.RestoreAudioModels();
+    if (audio_service_.AudioModelsReleased()) {
+        audio_service_.RestoreAudioModels();
+    }
 
     DeviceState state = GetDeviceState();
     switch (state) {

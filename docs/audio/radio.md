@@ -139,7 +139,8 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 
 - Radio `ReleaseAudioExclusive`：**只**关掉 `SetExternalPlaybackActive` / 关 input，**不** `RestoreAudioModels`
 - Music `ReleaseMicExclusive`：`EnableInput(false)`，**不** `RestoreAudioRouting`
-- `Application::RestoreAudioRouting`（Chat `OnEnter`）：统一 `RestoreAudioModels` + 按设备状态重绑唤醒词/拾音
+- `Application::RestoreAudioRouting`（Chat `OnEnter`，不含开机 Initialize）：仅当 `ReleaseAudioModels` 曾跑过才 `RestoreAudioModels`，再按设备状态重绑唤醒词/拾音
+- 开机 `PageManager::Initialize` 只 `ShowChatUi`，不调 Chat `OnEnter`：`SetupUI` 早于 `AudioService::Initialize`，无条件 Restore 会空指针复位（闪一下黑屏）
 - Radio `CaptureAudioExclusive`：强制 `EnableInput(false)` + `ReleaseAudioModels`（幂等）+ 外部播放 hold
 - `ReleaseAudioModels` 先清空编解码队列，再关 Opus，避免队列缓冲残留占堆
 

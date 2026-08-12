@@ -25,8 +25,9 @@ void ChatPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     if (display != nullptr) {
         display->ShowChatUi();
     }
-    // Re-sync after Radio/Music steal the codec. Safe on boot too (wake word
-    // Enable* no-ops until models are ready).
+    // Re-sync after Radio/Music steal the codec. RestoreAudioModels is a no-op
+    // unless ReleaseAudioModels ran — boot Initialize must not take this path
+    // (AudioService::codec_ is still null during SetupUI).
     Application::GetInstance().RestoreAudioRouting();
 }
 
@@ -44,7 +45,12 @@ void PageManager::Initialize(CardputerAdvCarLcdDisplay* display, EmqxCarMqtt* mq
         Application::GetInstance().Schedule([this, id]() { ShowPage(id); });
     });
     current_ = PageId::Chat;
-    chat_page_.OnEnter(display_);
+    // Show Chat UI only. Do not ChatPage::OnEnter → RestoreAudioRouting:
+    // Application::Initialize calls SetupUI before AudioService::Initialize,
+    // so codec_ is still null (9a6221b RestoreAudioModels → LoadProhibited).
+    if (display_ != nullptr) {
+        display_->ShowChatUi();
+    }
 }
 
 Page* PageManager::GetPage(PageId id) {
