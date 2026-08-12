@@ -16,7 +16,7 @@ cd "$SCRIPT_DIR"
 
 IDF_PATH="${IDF_PATH:-$HOME/.espressif/v5.5.3/esp-idf}"
 if [ ! -f "$IDF_PATH/export.sh" ]; then
-  echo "[ERROR] 找不到 export.sh，请设置 IDF_PATH（当前: $IDF_PATH）"
+  echo "[ERROR] 找不到 export.sh，请设置 IDF_PATH（当前: ${IDF_PATH}）"
   exit 1
 fi
 # shellcheck disable=SC1090
@@ -91,7 +91,7 @@ echo "║  ESP-IDF / $BOARD_NAME"
 echo "╚══════════════════════════════════════╝"
 echo "IDF: $(idf.py --version 2>/dev/null | head -1)"
 [ -n "$PORT" ] && echo "串口: $PORT" || echo "[WARN] 未检测到 USB 串口；可 PORT=/dev/cu.usbmodemXXX ./flash.sh"
-echo "upload baud: $BAUD（慢速: BAUD=115200 ./flash.sh）"
+echo "upload baud: ${BAUD}（慢速: BAUD=115200 ./flash.sh）"
 echo "烧录后串口: ./monitor.sh"
 echo ""
 

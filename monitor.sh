@@ -8,7 +8,7 @@ cd "$SCRIPT_DIR"
 
 IDF_PATH="${IDF_PATH:-$HOME/.espressif/v5.5.3/esp-idf}"
 if [ ! -f "$IDF_PATH/export.sh" ]; then
-  echo "[ERROR] 找不到 export.sh，请设置 IDF_PATH（当前: $IDF_PATH）"
+  echo "[ERROR] 找不到 export.sh，请设置 IDF_PATH（当前: ${IDF_PATH}）"
   exit 1
 fi
 # shellcheck disable=SC1090
