@@ -1,6 +1,7 @@
 #include "page_manager.h"
 
 #include "application.h"
+#include "board.h"
 #include "cardputer_adv_lcd_display.h"
 #include "display/display.h"
 
@@ -44,10 +45,9 @@ void ChatPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     if (display != nullptr) {
         display->ShowChatUi();
     }
-    // Re-sync after Radio/Music steal the codec. RestoreAudioModels is a no-op
-    // unless ReleaseAudioModels ran — boot Initialize must not take this path
-    // (AudioService::codec_ is still null during SetupUI).
-    Application::GetInstance().RestoreAudioRouting();
+    // UI only. Do not RestoreAudioModels here: ShowPage still has switching_
+    // set, and Radio/Music may still be tearing down. Opus/mic rebuild is
+    // ScheduleChatAudioRestore after ShowPage clears switching_.
 }
 
 void ChatPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
@@ -64,7 +64,7 @@ void PageManager::Initialize(CardputerAdvCarLcdDisplay* display, EmqxCarMqtt* mq
         Application::GetInstance().Schedule([this, id]() { ShowPage(id); });
     });
     current_ = PageId::Chat;
-    // Show Chat UI only. Do not ChatPage::OnEnter → RestoreAudioRouting:
+    // Show Chat UI only. Do not ChatPage::OnEnter / ScheduleChatAudioRestore:
     // Application::Initialize calls SetupUI before AudioService::Initialize,
     // so codec_ is still null (9a6221b RestoreAudioModels → LoadProhibited).
     if (display_ != nullptr) {
@@ -131,7 +131,7 @@ void PageManager::RecoverToChat(const char* reason) {
     Page* stuck = GetPage(current_);
     if (stuck != nullptr && current_ != PageId::Chat) {
         // OnLeave first (Music drops mic; Radio stops stream; hide failed panel).
-        // Opus rebuild happens in Chat OnEnter → RestoreAudioRouting.
+        // Never RestoreAudioModels here — wait until Chat UI is shown.
         stuck->OnLeave(display_);
         stuck->ReleaseResidentUi(display_);
     }
@@ -151,6 +151,46 @@ void PageManager::RecoverToChat(const char* reason) {
             }
         }
     }
+    if (current_ == PageId::Chat) {
+        ScheduleChatAudioRestore();
+    }
+}
+
+void PageManager::ScheduleChatAudioRestore() {
+    // Next main-loop tick: ShowPage has returned, switching_ is already false,
+    // Chat UI is on screen. Never call from Radio/Music OnLeave or Initialize.
+    Application::GetInstance().Schedule([this]() {
+        if (switching_ || current_ != PageId::Chat) {
+            ESP_LOGW(TAG, "Chat audio restore dropped switching=%d page=%d",
+                     switching_ ? 1 : 0, static_cast<int>(current_));
+            return;
+        }
+        if (display_ == nullptr || !display_->IsChatUiVisible()) {
+            ESP_LOGW(TAG, "Chat audio restore dropped: Chat UI not visible");
+            return;
+        }
+        auto& app = Application::GetInstance();
+        auto& audio = app.GetAudioService();
+        auto* codec = Board::GetInstance().GetAudioCodec();
+        if (codec == nullptr) {
+            ESP_LOGW(TAG, "Chat audio restore skipped: codec null");
+            return;
+        }
+        if (audio.AudioModelsReleased()) {
+            audio.RestoreAudioModels();
+        } else {
+            ESP_LOGI(TAG, "Chat audio restore: models still resident, routing only");
+        }
+        app.RestoreAudioRouting();
+        codec->EnableInput(true);
+        if (!codec->output_enabled()) {
+            codec->EnableOutput(true);
+        }
+        ESP_LOGI(TAG, "Chat audio restore done heap=%u largest=%u in=%d out=%d ww=%d vp=%d",
+                 static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()),
+                 codec->input_enabled() ? 1 : 0, codec->output_enabled() ? 1 : 0,
+                 audio.IsWakeWordRunning() ? 1 : 0, audio.IsAudioProcessorRunning() ? 1 : 0);
+    });
 }
 
 void PageManager::ShowPage(PageId id) {
@@ -231,6 +271,9 @@ void PageManager::ShowPage(PageId id) {
              static_cast<int>(current_), static_cast<unsigned>(FreeHeap()),
              static_cast<unsigned>(LargestHeap()));
     switching_ = false;
+    if (current_ == PageId::Chat) {
+        ScheduleChatAudioRestore();
+    }
 }
 
 void PageManager::RefreshCurrentPage() {

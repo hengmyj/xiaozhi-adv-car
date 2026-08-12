@@ -20,7 +20,7 @@ Cardputer ADV（ESP32-S3FN8 + 8MB flash，**无 PSRAM**）上 Radio 页从「卡
 
 ## 修复：释放常驻 Opus（43KB）
 
-`AudioService` 的 Opus 编/解码器常驻占用 **43KB**，而 Radio 页直连 codec 播 PCM，根本用不到 Opus。进页时 `AudioService::ReleaseAudioModels()` 关掉这一对，离页 `RestoreAudioModels()` 重建。
+`AudioService` 的 Opus 编/解码器常驻占用 **43KB**，而 Radio 页直连 codec 播 PCM，根本用不到 Opus。进页时 `AudioService::ReleaseAudioModels()` 关掉这一对；**离页不重建**，等 Fn+1 回到 Chat 且页面完全显示后再 `ScheduleChatAudioRestore`。
 
 | 阶段 | 内部 SRAM 可用 |
 |------|----------------|
@@ -140,12 +140,30 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 
 - Radio `ReleaseAudioExclusive`：**只**关掉 `SetExternalPlaybackActive` / 关 input，**不** `RestoreAudioModels`
 - Music `ReleaseMicExclusive`：`EnableInput(false)`，**不** `RestoreAudioRouting`
-- `Application::RestoreAudioRouting`（Chat `OnEnter`，不含开机 Initialize）：仅当 `ReleaseAudioModels` 曾跑过才 `RestoreAudioModels`，再按设备状态重绑唤醒词/拾音
-- 开机 `PageManager::Initialize` 只 `ShowChatUi`，不调 Chat `OnEnter`：`SetupUI` 早于 `AudioService::Initialize`，无条件 Restore 会空指针复位（闪一下黑屏）
+- `PageManager::ScheduleChatAudioRestore`：仅在 `ShowPage(Chat)` 完成、`switching_` 已清、Chat UI 已显示后，用 `Application::Schedule` 延迟一拍再 `RestoreAudioModels` + `RestoreAudioRouting` + `EnableInput` / 唤醒词 / 语音处理。Radio/Music `OnLeave` **绝不** Restore
+- 仅当曾经 `ReleaseAudioModels` 才重建 Opus；开机 `Initialize` 不走 Chat `OnEnter` / Restore：`SetupUI` 早于 `AudioService::Initialize`，`codec_` 仍为空会 `LoadProhibited` 黑屏复位
 - Radio `CaptureAudioExclusive`：强制 `EnableInput(false)` + `ReleaseAudioModels`（幂等）+ 外部播放 hold
 - `ReleaseAudioModels` 先清空编解码队列，再关 Opus，避免队列缓冲残留占堆
 
-串口应能看到：`OnLeave` → `audio exclusive OFF (models deferred)` →（Car/Music 无 Opus restore）→ 再进 `OnEnter` → `released audio models`（常为 enc=0 dec=0）→ `mp3 decoder open ok` → `self-test tone` → `pcm chunks=…`。回 Chat 时应有 `RestoreAudioRouting` + `restored audio models`。
+串口应能看到：`OnLeave` → `audio exclusive OFF (models deferred)` →（Car/Music 无 Opus restore）→ 再进 `OnEnter` → `released audio models`（常为 enc=0 dec=0）→ `mp3 decoder open ok` → `self-test tone` → `pcm chunks=…`。Fn+1 回 Chat：`ShowPage leave … ok` → `Chat audio restore done` + `restored audio models` + `RestoreAudioRouting`。
+
+### Radio → Fn+1 Chat 听不到说话
+
+#### 现象
+
+Radio 能播；**Fn+1 完全回到 Chat 后再说话**，小智 TTS 无声（麦克风路径同样哑）。
+
+#### 根因
+
+进 Radio 会 `ReleaseAudioModels` 关掉 Opus 编/解码器（约 43KB）。`OpusCodecTask` 在 `opus_decoder_ == nullptr` 时直接跳过解码，TTS 包被吃掉但不播。旧代码把 Restore 声明在 `ScheduleChatAudioRestore`，但函数未实现、Chat `OnEnter` 也不再 Restore，回 Chat 后解码器一直是空的。若在 Radio `OnLeave` 立刻 Restore，又会和独占页互切抢堆；若开机 `Initialize` 走 Chat `OnEnter` Restore，此时 `codec_` 仍为 null，会黑屏复位。
+
+#### 修复
+
+- Radio/Music Leave：`StopStream` / 关 exclusive / `DestroyPanel`，**不** `RestoreAudioModels`
+- `ShowPage(Chat)` 成功（或 `RecoverToChat` 回到 Chat）且 `switching_ = false`、Chat UI 可见后，`Application::Schedule` 下一拍再 Restore
+- 回调里再确认仍在 Chat、UI 可见、`codec_ != nullptr`；仅 `AudioModelsReleased()` 时重建 Opus，然后 `RestoreAudioRouting` + `EnableInput(true)`
+
+串口对照：`ShowPage leave 9 -> 1 ok` → `restored audio models enc=1 dec=1` → `RestoreAudioRouting` → `Chat audio restore done`。随后说话应有 TTS 播放。
 
 ### Music → Launcher → Radio 仍无声
 
@@ -239,6 +257,6 @@ Car/IceBox 的 hidden 仪表盘才是 1–4→Radio 的主因；Clock/Matrix 对
 ## 遗留项
 
 - 稳定态仅剩 **15-20KB** 内部 SRAM，余量不宽裕。
-- 「进 Radio 到离页再聊天语音」依赖 Chat `RestoreAudioRouting`→`RestoreAudioModels`（独占页互切不再离页重建）；二次进 Radio 见上文「进出页二次进入无声」。
+- 「进 Radio 再 Fn+1 回 Chat 说话」依赖 `ShowPage(Chat)` 完成后的 `ScheduleChatAudioRestore`（独占页 Leave 不重建 Opus）；二次进 Radio 见上文「进出页二次进入无声」。
 - 目前只验证 Music 台 `http://lhttp.qtfm.cn/live/332/64k.mp3`；News 台未逐项确认。
 - 24kHz 最近邻重采样高频有混叠，音质一般但可用。

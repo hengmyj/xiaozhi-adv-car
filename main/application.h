@@ -117,7 +117,8 @@ public:
 
     /**
      * Re-apply wake-word / voice-processing / speaker routing for the current
-     * device state. Call after exclusive pages (Radio/Music) release the codec.
+     * device state. Call from ScheduleChatAudioRestore after Chat is visible —
+     * never from Radio/Music OnLeave or boot Initialize (codec_ still null).
      */
     void RestoreAudioRouting();
     

@@ -53,4 +53,8 @@ private:
     Page* GetPage(PageId id);
     void RecoverToChat(const char* reason);
     void ReleaseOtherExclusiveUi(PageId keep);
+    // After Fn+1 Chat is fully shown (switching_ already false). Never from
+    // Radio/Music OnLeave — Opus rebuild during exclusive teardown fragments
+    // no-PSRAM heap. Boot Initialize must not call this (codec_ still null).
+    void ScheduleChatAudioRestore();
 };

@@ -897,7 +897,7 @@ void RadioPage::ReleaseAudioExclusive() {
     // RestoreAudioModels / RestoreAudioRouting here — Radio↔Car/Music would
     // rebuild Opus (~43KB) just to free it again on the next Radio enter, and
     // that thrash fragments the no-PSRAM heap so MP3 open/decode fails silently.
-    // Chat OnEnter → RestoreAudioRouting() rebuilds Opus when TTS is needed.
+    // Chat rebuilds after ShowPage(Chat) via ScheduleChatAudioRestore.
     if (!audio_exclusive_) {
         Application::GetInstance().GetAudioService().SetExternalPlaybackActive(false);
         ESP_LOGI(TAG, "audio exclusive OFF (already clear) heap=%u",
@@ -1363,6 +1363,7 @@ void RadioPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
              (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest());
     StopStream();
     DestroyPanel(display);
+    // Never RestoreAudioModels here — Chat does that after ShowPage completes.
 }
 
 void RadioPage::Tick(CardputerAdvCarLcdDisplay* display) {

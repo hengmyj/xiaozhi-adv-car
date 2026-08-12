@@ -162,7 +162,7 @@ void CursorPage::ReleaseMicExclusive() {
     saved_voice_proc_ = false;
     // Drop the mic path only. Do NOT RestoreAudioRouting here: that rebuilds Opus
     // and re-arms wake-word, which fights Radio re-enter (heap thrash + duplex RX
-    // left on). Chat OnEnter calls RestoreAudioRouting when TTS/voice is needed.
+    // left on). Chat rebuilds after ShowPage(Chat) via ScheduleChatAudioRestore.
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
         codec->EnableInput(false);

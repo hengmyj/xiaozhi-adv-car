@@ -1122,7 +1122,8 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 void Application::RestoreAudioRouting() {
     // Drop any exclusive hold (Radio direct OutputData) so power-save + TTS
     // can manage ES8311 again. Rebuild Opus only after an exclusive page
-    // Release — boot Chat OnEnter must not Restore (codec_ still null).
+    // Release — boot Initialize must not call this (codec_ still null).
+    // Called from PageManager::ScheduleChatAudioRestore after Chat is visible.
     audio_service_.SetExternalPlaybackActive(false);
     if (audio_service_.AudioModelsReleased()) {
         audio_service_.RestoreAudioModels();
