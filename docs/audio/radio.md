@@ -1,41 +1,82 @@
 # Radio 页：无 PSRAM 下的网络电台
 
-Cardputer ADV（ESP32-S3FN8 + 8MB flash，**无 PSRAM**）上 Radio 页从「进页卡死无声」调到「稳定播放」的完整结论。症状演变：**进页卡死无声 → 滋啦噪音 + 重启 → 滴一声后静音 → 正常播放**。
+Cardputer ADV（ESP32-S3FN8 + 8MB flash，**无 PSRAM**）上 Radio 页从「卡死无声」到「稳定播放」的调试结论。相关代码：
 
-代码：[`main/boards/m5stack-cardputer-adv-car/pages/radio/radio_page.cc`](../../main/boards/m5stack-cardputer-adv-car/pages/radio/radio_page.cc)、[`main/audio/audio_service.cc`](../../main/audio/audio_service.cc)。
+- [`main/boards/m5stack-cardputer-adv-car/pages/radio/radio_page.cc`](../../main/boards/m5stack-cardputer-adv-car/pages/radio/radio_page.cc)
+- [`main/audio/audio_service.cc`](../../main/audio/audio_service.cc)
+
+## 症状演变
+
+卡死无声 → 滋啦噪音 + 重启 → 滴一声后静音 → 正常播放
 
 ## 根因：内部 SRAM 不足
 
-本板没有 PSRAM（esptool 实测确认），所有音频缓冲都挤在内部 SRAM 里：
+本板没有 PSRAM（esptool 实测确认），所有音频缓冲只能进内部 SRAM。
 
 | 现象 | 直接原因 |
 |------|----------|
-| 无声 | 进 Radio 时可用内部 SRAM 仅 **27.3KB** → MP3 解码器初始化失败：`ESP_MP3_DEC: There is no memory for MP3 required`，ret `10` = `ESP_AUDIO_ERR_MEM_LACK` |
-| 设备重启 | 内存进一步耗尽到 **268 字节** → `getaddrinfo() returns 202`（`EAI_MEMORY`）、`HTTP_CLIENT: Allocation failed` |
+| 无声 | 进 Radio 时可用内部 SRAM 仅 **27.3KB**，MP3 解码器初始化失败。`ESP_MP3_DEC: There is no memory for MP3 required`；`ret 10` = `ESP_AUDIO_ERR_MEM_LACK` |
+| 设备重启 | 内存进一步耗尽到 **268 字节**。`getaddrinfo()` 返回 `202`（`EAI_MEMORY`）；`HTTP_CLIENT: Allocation failed` |
 
-**修复**：`AudioService` 的 Opus 编/解码器常驻占用 **43KB**，而 Radio 页直连 codec 播 PCM，根本用不到 Opus。进页时 `AudioService::ReleaseAudioModels()` 关掉这一对，离页 `RestoreAudioModels()` 重建：
+## 修复：释放常驻 Opus（43KB）
+
+`AudioService` 的 Opus 编/解码器常驻占用 **43KB**，而 Radio 页直连 codec 播 PCM，根本用不到 Opus。进页时 `AudioService::ReleaseAudioModels()` 关掉这一对，离页 `RestoreAudioModels()` 重建。
+
+| 阶段 | 内部 SRAM 可用 |
+|------|----------------|
+| 进页前（Opus 仍常驻） | **27.3KB** |
+| 释放 Opus 后 | **70.4KB** |
+| 播放稳定态 | **15–20KB** |
+
+对应日志：
 
 ```
 released audio models: internal heap 27340 -> 70432
 ```
 
-可用内存 27.3KB 提升到 **70.4KB**，播放稳定态余量 15-20KB。低于 `kMinHeapToStream`（12KB）直接拒绝开流并提示 `low memory`，不再靠崩溃暴露问题。
+低于 `kMinHeapToStream`（12KB）直接拒绝开流并提示 `low memory`，不再靠崩溃暴露问题。
 
-## 关键坑（避免重蹈覆辙）
+## 关键坑
 
-1. **`esp_audio_simple_dec_open()` 是惰性的**：只占 148～360 字节就返回成功，真正的解码器要等内置 parser 找到第一帧才分配。「open 成功」**不代表能解码**，这个假象误导了多轮排查。判断标准要看是否真的产出 PCM。
-2. **参考固件不可照搬**：[cyberwisk/M5Cardputer_WebRadio](https://github.com/cyberwisk/M5Cardputer_WebRadio) 能播，是因为**原版 Cardputer 有 8MB PSRAM**；它用的 ESP32-audioI2S 依赖 PSRAM 做大 ring buffer，那套「HTTPS + 128kbps」在无 PSRAM 的 ADV 上物理上跑不起来。本页选择**纯 HTTP + 64kbps 低码率**才是正确解（TLS 握手还要额外吃调用任务约 8-10KB 栈）。
-3. **释放唤醒词模型是无效方向**：本板 `CONFIG_WAKE_WORD_DISABLED=y`，**没有 AFE 实例**，实测释放前后 27392 -> 27392，一字节没省。省内存只能从 Opus 下手。
-4. **流任务必须在 core 0 / 优先级 3**：`taskLVGL` 在 **core 1 / 优先级 1**，流任务若放 core1/prio4 会直接饿死 LVGL，触发 `task_wdt: CPU 1: taskLVGL`。循环里用 `vTaskDelay(1)` 而非 `taskYIELD()`，否则 IDLE 任务拿不到 CPU。
-5. **按库标准用法喂解码器**：整块喂入、按 `raw.consumed` 推进缓冲。不要自己按 MPEG 帧头切帧，那会和库内置 parser 抢活导致失步。
-6. **保护逻辑不能过激**：早期 `consec_bad > 64` 会在第一次 512 字节读取后就掐断流，这正是「滴一声就没了」的原因。现放宽为「连续 2000 次失败且从未产出任何 PCM」才放弃，另有 48KB 入流仍无 PCM 的兜底。
-7. **进页 440Hz / 350ms 自检音很有价值**：响了即说明 ES8311 + 功放 + I2S 时钟格式正常，能一秒区分硬件问题和网络/解码问题。
-8. **重采样**：解码输出 44100Hz / 2ch / 16bit，codec 是 24000Hz mono，用最近邻重采样 + 相位累积（`resample_pos`）降混。
-9. **安全约束：宁可静音也不送数据**。格式不是 16bit、或拿不到解码器 info 时一律不输出。把未解码的 MP3 原始字节当 PCM 播，正是滋啦噪音的来源。
+1. **惰性 open**
 
-## 串口日志对照表
+   `esp_audio_simple_dec_open()` 只占 148～360 字节就返回成功，真正的解码器要等内置 parser 找到第一帧才分配。「open 成功」**不代表能解码**，这个假象误导了多轮排查。判断标准要看是否真的产出 PCM。
 
-正常播放时依次出现：
+2. **WebRadio 因 PSRAM 不可照搬**
+
+   [cyberwisk/M5Cardputer_WebRadio](https://github.com/cyberwisk/M5Cardputer_WebRadio) 能播，是因为**原版 Cardputer 有 8MB PSRAM**；它用的 ESP32-audioI2S 依赖 PSRAM 做大 ring buffer，那套「HTTPS + 128kbps」在无 PSRAM 的 ADV 上物理上跑不起来。本页选择**纯 HTTP + 64kbps 低码率**才是正确解（TLS 握手还要额外吃调用任务约 8-10KB 栈）。
+
+3. **本板无 AFE**
+
+   本板 `CONFIG_WAKE_WORD_DISABLED=y`，**没有 AFE 实例**，释放唤醒词模型是无效方向。实测释放前后 27392 -> 27392，一字节没省。省内存只能从 Opus 下手。
+
+4. **流任务必须 core 0 / 优先级 3**
+
+   `taskLVGL` 在 **core 1 / 优先级 1**，流任务若放 core1/prio4 会直接饿死 LVGL，触发 `task_wdt: CPU 1: taskLVGL`。循环里用 `vTaskDelay(1)` 而非 `taskYIELD()`，否则 IDLE 任务拿不到 CPU。
+
+5. **整块喂入，按 `raw.consumed` 推进**
+
+   按库标准用法喂解码器：整块喂入、按 `raw.consumed` 推进缓冲。不要自己按 MPEG 帧头切帧，那会和库内置 parser 抢活导致失步。
+
+6. **保护逻辑过激**
+
+   早期 `consec_bad > 64` 会在第一次 512 字节读取后就掐断流，这正是「滴一声就没了」的原因。现放宽为「连续 2000 次失败且从未产出任何 PCM」才放弃，另有 48KB 入流仍无 PCM 的兜底。
+
+7. **440Hz 自检音**
+
+   进页 440Hz / 350ms 自检音很有价值：响了即说明 ES8311 + 功放 + I2S 时钟格式正常，能一秒区分硬件问题和网络/解码问题。
+
+8. **44100 → 24000 重采样**
+
+   解码输出 44100Hz / 2ch / 16bit，codec 是 24000Hz mono，用最近邻重采样 + 相位累积（`resample_pos`）降混。
+
+9. **宁可静音，不送未解码字节**
+
+   格式不是 16bit、或拿不到解码器 info 时一律不输出。把未解码的 MP3 原始字节当 PCM 播，正是滋啦噪音的来源。
+
+## 串口日志对照
+
+正常播放时应依次出现：
 
 ```
 released audio models: internal heap 27340 -> 70432
@@ -56,11 +97,20 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 | `task_wdt: CPU 1: taskLVGL` | 流任务抢了 core 1，检查 `kTaskCore` / `kTaskPrio` |
 | `MP3 unavailable (register=... check=...)` | `CONFIG_AUDIO_DECODER_MP3_SUPPORT` 没开 |
 
-每次退出都会打印 `session end [原因]`，原因取值：`user stop / page change`、`http read error`、`stream idle (EOF or timeout)`、`decoder rejected/failed`、`no PCM produced`。
+每次退出都会打印 `session end [原因]`，原因取值：
+
+| 原因 | 含义 |
+|------|------|
+| `user stop / page change` | 用户停止或切页 |
+| `http read error` | HTTP 读失败 |
+| `stream idle (EOF or timeout)` | 流空闲（EOF 或超时） |
+| `decoder rejected/failed` | 解码器拒绝或失败 |
+| `no PCM produced` | 从未产出 PCM |
 
 ## 配置要点
 
-- `CONFIG_AUDIO_DECODER_MP3_SUPPORT=y`，其余 codec（G711/AMR 等）关掉省 flash；见 [`main/boards/m5stack-cardputer-adv-car/config.json`](../../main/boards/m5stack-cardputer-adv-car/config.json) 与 [`flash.sh`](../../flash.sh)（kconfig choice 里旧的 `=y` 必须先置 `n`，顺序有意义）。
+- 台源用**纯 HTTP + 64kbps** MP3，不要 HTTPS / 高码率。
+- `CONFIG_AUDIO_DECODER_MP3_SUPPORT=y` 必须开，其余 codec（G711/AMR 等）关掉省 flash；见 [`main/boards/m5stack-cardputer-adv-car/config.json`](../../main/boards/m5stack-cardputer-adv-car/config.json) 与 [`flash.sh`](../../flash.sh)（kconfig choice 里旧的 `=y` 必须先置 `n`，顺序有意义）。**不要在 `flash.sh` 里把 MP3 decoder 关掉。**
 - 控制台必须保持开启（`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` + `LOG_DEFAULT_LEVEL_INFO`）：早期 `CONFIG_ESP_CONSOLE_NONE=y` 使 panic handler 无处输出，重启循环里连 backtrace 都看不到。配合 `ESP_SYSTEM_PANIC_PRINT_REBOOT` 与 5 秒延迟，让 USB-CDC 有时间冲出 backtrace。
 - 改分区表后需整包烧录：`./flash.sh`，串口另开 `./monitor.sh`（见 [build/flash.md](../build/flash.md)）。
 
