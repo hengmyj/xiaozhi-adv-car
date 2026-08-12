@@ -64,16 +64,22 @@ protected:
 class DisplayLockGuard {
 public:
     DisplayLockGuard(Display *display) : display_(display) {
-        if (!display_->Lock(30000)) {
-            ESP_LOGE("Display", "Failed to lock display");
+        // Short timeout: never block UI path for 30s (IR/network can starve LVGL).
+        locked_ = display_->Lock(2000);
+        if (!locked_) {
+            ESP_LOGE("Display", "Failed to lock display (2s)");
         }
     }
     ~DisplayLockGuard() {
-        display_->Unlock();
+        // Only unlock if we actually took the lock — otherwise we corrupt LVGL mutex.
+        if (locked_) {
+            display_->Unlock();
+        }
     }
 
 private:
     Display *display_;
+    bool locked_ = false;
 };
 
 class NoDisplay : public Display {

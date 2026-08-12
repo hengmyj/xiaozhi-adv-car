@@ -66,10 +66,14 @@ ensure_board_sdkconfig() {
     'CONFIG_AUDIO_DECODER_AAC_SUPPORT=y' \
     'CONFIG_AUDIO_SIMPLE_DEC_WAV_SUPPORT=n' \
     'CONFIG_AUDIO_SIMPLE_DEC_M4A_SUPPORT=n' \
-    'CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT=y'
+    'CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT=y' \
+    'CONFIG_ESP_TLS_INSECURE=y' \
+    'CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y'
   do
     key="${kv%%=*}"
-    if grep -q "^${key}=" sdkconfig 2>/dev/null; then
+    if grep -q "^# ${key} is not set" sdkconfig 2>/dev/null; then
+      sed -i.bak "s|^# ${key} is not set|${kv}|" sdkconfig && rm -f sdkconfig.bak
+    elif grep -q "^${key}=" sdkconfig 2>/dev/null; then
       sed -i.bak "s|^${key}=.*|${kv}|" sdkconfig && rm -f sdkconfig.bak
     else
       echo "$kv" >> sdkconfig

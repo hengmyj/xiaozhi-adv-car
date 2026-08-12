@@ -123,16 +123,13 @@ void PageManager::ShowPage(PageId id) {
         mqtt_->PublishCarCmd(0, mqtt_->speed());
     }
 
-    // Audio-holding pages must OnLeave before Chat (or next page) takes the codec.
-    // Otherwise Radio stream / mic exclusive can race with TTS wake-word restore.
-    const bool prev_holds_audio = (prev == PageId::Radio || prev == PageId::Music);
-    const bool next_needs_clean_audio = (id == PageId::Chat || id == PageId::Radio || id == PageId::Music);
-    if (prev_holds_audio || next_needs_clean_audio) {
+    // Leave-first for exclusive→exclusive (IceBox IR / Radio / …). Chat→page
+    // still enters first so HideChatUi never leaves a WiFi-only blank frame.
+    if (prev != PageId::Chat) {
         current->OnLeave(display_);
         current_ = id;
         next->OnEnter(display_);
     } else {
-        // Show next first, then hide previous — avoids a blank gap where only top_bar WiFi remains.
         current_ = id;
         next->OnEnter(display_);
         current->OnLeave(display_);

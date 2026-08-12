@@ -8,6 +8,7 @@
 
 class CardputerAdvCarLcdDisplay;
 
+// Matrix rain via ONE RGB565 canvas (Clock-style) — no 100+ labels on no-PSRAM.
 class MatrixPage : public Page {
 public:
     void OnEnter(CardputerAdvCarLcdDisplay* display) override;
@@ -18,32 +19,31 @@ public:
 private:
     void BuildPanel(CardputerAdvCarLcdDisplay* display);
     void DestroyPanel(CardputerAdvCarLcdDisplay* display);
-    void ResetAnimationState();
+    void ResetDrops();
     void StepAnimation(CardputerAdvCarLcdDisplay* display);
-    void ApplyCellVisual(int c, int r, uint8_t band);
+    void PaintFrame();
 
-    static constexpr int kCols = 10;
-    static constexpr int kRows = 11;
-    static constexpr int kTrail = 9;
-    // Quantized visual bands (avoid per-frame style churn / heap realloc).
-    static constexpr uint8_t kBandDead = 0;
-    static constexpr uint8_t kBandDim = 1;
-    static constexpr uint8_t kBandMid = 2;
-    static constexpr uint8_t kBandBright = 3;
-    static constexpr uint8_t kBandHead = 4;
+    // Half-res canvas + 2x zoom → 240×136; ~16KB BSS (safe on 8MB / no-PSRAM).
+    static constexpr int kCols = 12;
+    static constexpr int kRows = 9;
+    static constexpr int kCellW = 10;
+    static constexpr int kCellH = 7;
+    static constexpr int kCanvasW = 120;  // even for RGB565 row align
+    static constexpr int kCanvasH = 68;
+    static constexpr int kTrail = 7;
 
     CardputerAdvCarLcdDisplay* display_ = nullptr;
     bool active_ = false;
+    bool stepping_ = false;
     lv_obj_t* panel_ = nullptr;
-    // Fixed label pool (created once, recycled via life_/band_).
-    lv_obj_t* cells_[kCols][kRows] = {};
+    lv_obj_t* canvas_ = nullptr;
+    uint16_t canvas_buf_[kCanvasW * kCanvasH] = {};
+
     uint8_t life_[kCols][kRows] = {};
-    uint8_t band_[kCols][kRows] = {};
-    char text_buf_[kCols][kRows][2] = {};
+    char glyph_[kCols][kRows] = {};
     float head_y_[kCols] = {};
     float speed_[kCols] = {};
     int last_row_[kCols] = {};
     uint32_t rng_ = 1;
     uint32_t tick_count_ = 0;
-    uint32_t heap_at_enter_ = 0;
 };

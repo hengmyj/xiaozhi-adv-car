@@ -6,7 +6,6 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 
-#include <cstdio>
 #include <cstring>
 
 #define TAG "MatrixPage"
@@ -15,11 +14,54 @@ namespace {
 
 constexpr lv_coord_t kScreenW = 240;
 constexpr lv_coord_t kScreenH = 135;
-constexpr int kCharH = 12;
-constexpr int kColW = 24;
-constexpr uint32_t kHeapLogEvery = 50;  // ~5s at 100ms tick
+constexpr int kCanvasW = 120;
+constexpr int kCanvasH = 68;
 
-const char kCharset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*<>/\\|";
+// Tiny 5×7 glyphs (same idea as Clock) — painted into canvas cells, no LVGL labels.
+constexpr int kGlyphW = 5;
+constexpr int kGlyphH = 7;
+
+const char kCharset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*";
+
+// Sparse bitmaps for A-Z / 0-9 / symbols — index via CharGlyph().
+constexpr const char* kAlpha[36][kGlyphH] = {
+    {".***.", "*...*", "*****", "*...*", "*...*", "*...*", "*...*"},  // A
+    {"****.", "*...*", "****.", "*...*", "*...*", "*...*", "****."},
+    {".****", "*....", "*....", "*....", "*....", "*....", ".****"},
+    {"****.", "*...*", "*...*", "*...*", "*...*", "*...*", "****."},
+    {"*****", "*....", "****.", "*....", "*....", "*....", "*****"},
+    {"*****", "*....", "****.", "*....", "*....", "*....", "*...."},
+    {".****", "*....", "*....", "*..**", "*...*", "*...*", ".****"},
+    {"*...*", "*...*", "*****", "*...*", "*...*", "*...*", "*...*"},
+    {"*****", "..*..", "..*..", "..*..", "..*..", "..*..", "*****"},
+    {"..***", "...*.", "...*.", "...*.", "...*.", "*..*.", ".***."},
+    {"*...*", "*..*.", "**...", "*.*..", "*..*.", "*...*", "*...*"},
+    {"*....", "*....", "*....", "*....", "*....", "*....", "*****"},
+    {"*...*", "**.**", "*.*.*", "*...*", "*...*", "*...*", "*...*"},
+    {"*...*", "**..*", "*.*.*", "*..**", "*...*", "*...*", "*...*"},
+    {".***.", "*...*", "*...*", "*...*", "*...*", "*...*", ".***."},
+    {"****.", "*...*", "*...*", "****.", "*....", "*....", "*...."},
+    {".***.", "*...*", "*...*", "*...*", "*.*.*", "*..*.", ".**.*"},
+    {"****.", "*...*", "*...*", "****.", "*..*.", "*...*", "*...*"},
+    {".****", "*....", "*....", ".***.", "....*", "....*", "****."},
+    {"*****", "..*..", "..*..", "..*..", "..*..", "..*..", "..*.."},
+    {"*...*", "*...*", "*...*", "*...*", "*...*", "*...*", ".***."},
+    {"*...*", "*...*", "*...*", "*...*", ".*.*.", ".*.*.", "..*.."},
+    {"*...*", "*...*", "*...*", "*.*.*", "*.*.*", "**.**", "*...*"},
+    {"*...*", ".*.*.", "..*..", "..*..", "..*..", ".*.*.", "*...*"},
+    {"*...*", ".*.*.", "..*..", "..*..", "..*..", "..*..", "..*.."},
+    {"*****", "....*", "...*.", "..*..", ".*...", "*....", "*****"},
+    {".***.", "*...*", "*..**", "*.*.*", "**..*", "*...*", ".***."},  // 0
+    {"..*..", ".**..", "..*..", "..*..", "..*..", "..*..", "*****"},
+    {".***.", "*...*", "....*", "...*.", "..*..", ".*...", "*****"},
+    {"*****", "....*", "...*.", "..**.", "....*", "*...*", ".***."},
+    {"...*.", "..**.", ".*.*.", "*..*.", "*****", "...*.", "...*."},
+    {"*****", "*....", "****.", "....*", "....*", "*...*", ".***."},
+    {"..**.", ".*...", "*....", "****.", "*...*", "*...*", ".***."},
+    {"*****", "....*", "...*.", "..*..", ".*...", ".*...", ".*..."},
+    {".***.", "*...*", "*...*", ".***.", "*...*", "*...*", ".***."},
+    {".***.", "*...*", "*...*", ".****", "....*", "...*.", ".***."},
+};
 
 void StripStyles(lv_obj_t* obj) {
     lv_obj_remove_style_all(obj);
@@ -31,65 +73,65 @@ void StripStyles(lv_obj_t* obj) {
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICK_FOCUSABLE);
 }
 
-uint8_t BandFromLife(uint8_t life, bool is_head) {
+int CharGlyph(char c) {
+    if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= '0' && c <= '9') {
+        return 26 + (c - '0');
+    }
+    return -1;
+}
+
+// RGB565 greens by life band.
+uint16_t ColorForLife(uint8_t life, bool is_head) {
     if (life == 0) {
-        return 0;  // kBandDead
+        return 0x0000;
     }
     if (is_head && life > 200) {
-        return 4;  // kBandHead
+        return 0xCFF9;  // near-white green
     }
     if (life > 160) {
-        return 3;  // kBandBright
+        return 0x27E8;  // bright
     }
     if (life > 80) {
-        return 2;  // kBandMid
+        return 0x1484;  // mid
     }
-    return 1;  // kBandDim
+    return 0x0A42;  // dim
+}
+
+void PaintGlyph(uint16_t* buf, char c, int ox, int oy, uint16_t color) {
+    int gi = CharGlyph(c);
+    if (gi < 0 || color == 0) {
+        return;
+    }
+    for (int r = 0; r < kGlyphH; ++r) {
+        for (int col = 0; col < kGlyphW; ++col) {
+            if (kAlpha[gi][r][col] != '*') {
+                continue;
+            }
+            const int x = ox + col;
+            const int y = oy + r;
+            if (x >= 0 && x < kCanvasW && y >= 0 && y < kCanvasH) {
+                buf[y * kCanvasW + x] = color;
+            }
+        }
+    }
 }
 
 }  // namespace
 
-void MatrixPage::ApplyCellVisual(int c, int r, uint8_t band) {
-    lv_obj_t* cell = cells_[c][r];
-    if (cell == nullptr) {
-        return;
-    }
-    band_[c][r] = band;
-    switch (band) {
-        case kBandHead:
-            lv_obj_set_style_text_color(cell, lv_color_hex(0xCCFFCC), 0);
-            lv_obj_set_style_text_opa(cell, 230, 0);
-            break;
-        case kBandBright:
-            lv_obj_set_style_text_color(cell, lv_color_hex(0x33FF88), 0);
-            lv_obj_set_style_text_opa(cell, 180, 0);
-            break;
-        case kBandMid:
-            lv_obj_set_style_text_color(cell, lv_color_hex(0x009944), 0);
-            lv_obj_set_style_text_opa(cell, 120, 0);
-            break;
-        case kBandDim:
-            lv_obj_set_style_text_color(cell, lv_color_hex(0x006622), 0);
-            lv_obj_set_style_text_opa(cell, 70, 0);
-            break;
-        default:
-            text_buf_[c][r][0] = ' ';
-            text_buf_[c][r][1] = '\0';
-            lv_label_set_text_static(cell, text_buf_[c][r]);
-            lv_obj_set_style_text_opa(cell, LV_OPA_TRANSP, 0);
-            break;
-    }
-}
-
-void MatrixPage::ResetAnimationState() {
+void MatrixPage::ResetDrops() {
     tick_count_ = 0;
+    rng_ = 0xA5A5u ^ static_cast<uint32_t>(esp_log_timestamp());
     for (int c = 0; c < kCols; ++c) {
+        rng_ = rng_ * 1664525u + 1013904223u;
+        head_y_[c] = static_cast<float>(static_cast<int>(rng_ % 90) - 70);
+        speed_[c] = 1.6f + static_cast<float>(rng_ % 40) / 18.0f;
         last_row_[c] = -999;
         for (int r = 0; r < kRows; ++r) {
             life_[c][r] = 0;
-            band_[c][r] = kBandDead;
-            text_buf_[c][r][0] = ' ';
-            text_buf_[c][r][1] = '\0';
+            glyph_[c][r] = ' ';
         }
     }
 }
@@ -101,21 +143,17 @@ void MatrixPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     DisplayLockGuard lock(display);
     lv_obj_del(panel_);
     panel_ = nullptr;
-    for (int c = 0; c < kCols; ++c) {
-        for (int r = 0; r < kRows; ++r) {
-            cells_[c][r] = nullptr;
-            life_[c][r] = 0;
-            band_[c][r] = kBandDead;
-            text_buf_[c][r][0] = ' ';
-            text_buf_[c][r][1] = '\0';
-        }
-    }
+    canvas_ = nullptr;
 }
 
 void MatrixPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ != nullptr) {
         return;
     }
+
+    ESP_LOGI(TAG, "BuildPanel canvas %dx%d buf=%u heap=%u", kCanvasW, kCanvasH,
+             static_cast<unsigned>(sizeof(canvas_buf_)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 
     DisplayLockGuard lock(display);
     panel_ = lv_obj_create(display->GetScreen());
@@ -125,99 +163,89 @@ void MatrixPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     lv_obj_set_style_bg_color(panel_, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(panel_, LV_OPA_COVER, 0);
 
-    rng_ = 0xA5A5u ^ static_cast<uint32_t>(esp_log_timestamp());
-    for (int c = 0; c < kCols; ++c) {
-        rng_ = rng_ * 1664525u + 1013904223u;
-        head_y_[c] = static_cast<float>(static_cast<int>(rng_ % 140) - 100);
-        speed_[c] = 0.9f + static_cast<float>(rng_ % 50) / 40.0f;
-        last_row_[c] = -999;
+    canvas_ = lv_canvas_create(panel_);
+    lv_canvas_set_buffer(canvas_, canvas_buf_, kCanvasW, kCanvasH, LV_COLOR_FORMAT_RGB565);
+    // 2× zoom → ~240×136, fills the 240×135 screen.
+    lv_img_set_zoom(canvas_, 512);
+    lv_obj_align(canvas_, LV_ALIGN_TOP_LEFT, 0, 0);
+    std::memset(canvas_buf_, 0, sizeof(canvas_buf_));
+    lv_obj_invalidate(canvas_);
+}
 
+void MatrixPage::PaintFrame() {
+    if (canvas_ == nullptr) {
+        return;
+    }
+    std::memset(canvas_buf_, 0, sizeof(canvas_buf_));
+    for (int c = 0; c < kCols; ++c) {
+        const int head_row = static_cast<int>(head_y_[c] / kCellH);
         for (int r = 0; r < kRows; ++r) {
-            cells_[c][r] = lv_label_create(panel_);
-            text_buf_[c][r][0] = ' ';
-            text_buf_[c][r][1] = '\0';
-            lv_obj_set_style_text_font(cells_[c][r], &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(cells_[c][r], lv_color_hex(0x00FF66), 0);
-            lv_obj_set_style_text_opa(cells_[c][r], LV_OPA_TRANSP, 0);
-            // Static text: no free/malloc on glyph change (was heap-fragmenting).
-            lv_label_set_text_static(cells_[c][r], text_buf_[c][r]);
-            lv_obj_set_pos(cells_[c][r], c * kColW + 2, r * kCharH);
-            life_[c][r] = 0;
-            band_[c][r] = kBandDead;
+            if (life_[c][r] == 0 || glyph_[c][r] == ' ') {
+                continue;
+            }
+            const uint16_t color = ColorForLife(life_[c][r], r == head_row);
+            PaintGlyph(canvas_buf_, glyph_[c][r], c * kCellW + 2, r * kCellH, color);
         }
     }
+    lv_obj_invalidate(canvas_);
 }
 
 void MatrixPage::StepAnimation(CardputerAdvCarLcdDisplay* display) {
-    if (!active_ || panel_ == nullptr || display == nullptr) {
+    if (!active_ || panel_ == nullptr || display == nullptr || stepping_) {
         return;
     }
-
+    stepping_ = true;
     ++tick_count_;
-    if ((tick_count_ % kHeapLogEvery) == 0) {
-        const uint32_t heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        const int32_t delta = static_cast<int32_t>(heap) - static_cast<int32_t>(heap_at_enter_);
-        ESP_LOGI(TAG, "tick=%u heap=%u delta=%ld", static_cast<unsigned>(tick_count_),
-                 static_cast<unsigned>(heap), static_cast<long>(delta));
-        // Soft assert: matrix must not steadily consume internal heap.
-        if (delta < -4096) {
-            ESP_LOGW(TAG, "heap dropped >4KB since enter (possible leak)");
-        }
-    }
 
-    DisplayLockGuard lock(display);
-    // Cap work: only touch cells whose glyph/band actually changed.
     for (int c = 0; c < kCols; ++c) {
         head_y_[c] += speed_[c];
-        if (head_y_[c] > kScreenH + kTrail * kCharH) {
+        if (head_y_[c] > kCanvasH + kTrail * kCellH) {
             rng_ = rng_ * 1664525u + 1013904223u;
-            head_y_[c] = static_cast<float>(-static_cast<int>(rng_ % 60) - 20);
-            speed_[c] = 0.8f + static_cast<float>(rng_ % 55) / 40.0f;
+            head_y_[c] = static_cast<float>(-static_cast<int>(rng_ % 30) - 6);
+            speed_[c] = 1.4f + static_cast<float>(rng_ % 45) / 16.0f;
             last_row_[c] = -999;
         }
 
-        const int head_row = static_cast<int>(head_y_[c] / kCharH);
+        const int head_row = static_cast<int>(head_y_[c] / kCellH);
         if (head_row != last_row_[c] && head_row >= 0 && head_row < kRows) {
             last_row_[c] = head_row;
             rng_ = rng_ * 1664525u + 1013904223u;
-            text_buf_[c][head_row][0] = kCharset[rng_ % (sizeof(kCharset) - 1)];
-            text_buf_[c][head_row][1] = '\0';
+            glyph_[c][head_row] = kCharset[rng_ % (sizeof(kCharset) - 1)];
             life_[c][head_row] = 255;
-            lv_label_set_text_static(cells_[c][head_row], text_buf_[c][head_row]);
         }
 
         for (int r = 0; r < kRows; ++r) {
             if (life_[c][r] == 0) {
-                // Already dead: do not touch LVGL every tick (was 110 style ops/frame).
                 continue;
             }
-
-            const int decay = 6 + (r + c) % 4;
+            const int decay = 18 + (r + c) % 5;
             if (life_[c][r] > decay) {
                 life_[c][r] = static_cast<uint8_t>(life_[c][r] - decay);
             } else {
                 life_[c][r] = 0;
-            }
-
-            if (life_[c][r] == 0) {
-                ApplyCellVisual(c, r, kBandDead);
+                glyph_[c][r] = ' ';
                 continue;
             }
-
-            // Occasional glyph morph in the trail (static buf, no malloc).
-            if (life_[c][r] > 40 && ((rng_ + c * 17 + r) % 11 == 0)) {
+            if (life_[c][r] > 40 && ((rng_ + c * 17 + r) % 5 == 0)) {
                 rng_ = rng_ * 1664525u + 1013904223u;
-                text_buf_[c][r][0] = kCharset[rng_ % (sizeof(kCharset) - 1)];
-                text_buf_[c][r][1] = '\0';
-                lv_label_set_text_static(cells_[c][r], text_buf_[c][r]);
-            }
-
-            const uint8_t band = BandFromLife(life_[c][r], r == head_row);
-            if (band != band_[c][r]) {
-                ApplyCellVisual(c, r, band);
+                glyph_[c][r] = kCharset[rng_ % (sizeof(kCharset) - 1)];
             }
         }
     }
+
+    // Paint off-lock, invalidate under short DisplayLock (Clock pattern).
+    {
+        DisplayLockGuard lock(display);
+        if (active_ && canvas_ != nullptr) {
+            PaintFrame();
+        }
+    }
+
+    if ((tick_count_ % 50) == 0) {
+        ESP_LOGI(TAG, "tick=%u heap=%u", static_cast<unsigned>(tick_count_),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+    }
+    stepping_ = false;
 }
 
 void MatrixPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
@@ -226,53 +254,41 @@ void MatrixPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     }
     display_ = display;
     active_ = true;
-    heap_at_enter_ = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG, "OnEnter matrix rain reuse=%d heap=%u", panel_ != nullptr ? 1 : 0,
-             static_cast<unsigned>(heap_at_enter_));
+    stepping_ = false;
+    ESP_LOGI(TAG, "OnEnter matrix canvas reuse=%d heap=%u", panel_ != nullptr ? 1 : 0,
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 
     BuildPanel(display);
     if (panel_ == nullptr) {
         ESP_LOGE(TAG, "BuildPanel failed");
+        active_ = false;
         return;
     }
 
-    // Re-seed drop heads; clear trails so reused panel has no stale life.
     {
         DisplayLockGuard lock(display);
-        ResetAnimationState();
-        rng_ = 0xA5A5u ^ static_cast<uint32_t>(esp_log_timestamp());
-        for (int c = 0; c < kCols; ++c) {
-            rng_ = rng_ * 1664525u + 1013904223u;
-            head_y_[c] = static_cast<float>(static_cast<int>(rng_ % 140) - 100);
-            speed_[c] = 0.9f + static_cast<float>(rng_ % 50) / 40.0f;
-            for (int r = 0; r < kRows; ++r) {
-                if (cells_[c][r] != nullptr) {
-                    ApplyCellVisual(c, r, kBandDead);
-                }
-            }
+        ResetDrops();
+        std::memset(canvas_buf_, 0, sizeof(canvas_buf_));
+        if (canvas_ != nullptr) {
+            lv_obj_invalidate(canvas_);
         }
+        // Show panel BEFORE HideChatUi so we never flash WiFi-only blank.
         lv_obj_clear_flag(panel_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(panel_);
     }
     display->HideChatUi();
     StepAnimation(display);
+    ESP_LOGI(TAG, "OnEnter done heap=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 }
 
 void MatrixPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
     active_ = false;
+    stepping_ = false;
     if (display == nullptr || panel_ == nullptr) {
         return;
     }
     DisplayLockGuard lock(display);
-    // Stop animation state so Tick does no LVGL work after leave.
-    ResetAnimationState();
-    for (int c = 0; c < kCols; ++c) {
-        for (int r = 0; r < kRows; ++r) {
-            if (cells_[c][r] != nullptr) {
-                ApplyCellVisual(c, r, kBandDead);
-            }
-        }
-    }
     lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
 }
 

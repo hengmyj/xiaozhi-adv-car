@@ -9,16 +9,19 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 
+#include <atomic>
+
 #define TAG "MitsubishiIr"
 
 namespace {
 
 constexpr int kIrQueueDepth = 4;
-// Extra full-frame retransmission (many wall remotes fire 2ù3 bursts).
-// Library already applies kMitsubishiACMinRepeat (=1 ? 2 frames); we send
-// the whole burst a second time for better range / reliability.
+// Extra full-frame retransmission (many wall remotes fire 2?3 bursts).
 constexpr int kExtraBurstCount = 1;
 constexpr int kBurstGapMs = 40;
+// Modest boost only ? NEVER configMAX_PRIORITIES (starves LVGL on same core).
+constexpr UBaseType_t kIrTxPrio = 6;
+constexpr UBaseType_t kIrIdlePrio = 3;
 
 struct IrSendRequest {
     MjAcState state;
@@ -80,35 +83,47 @@ void ApplyState(IRMitsubishiAC* ac, const MjAcState& state) {
     ac->setFan(MapFan(state.fan));
 }
 
+QueueHandle_t g_queue = nullptr;
+TaskHandle_t g_task = nullptr;
+IRMitsubishiAC* g_ac = nullptr;
+std::atomic<bool> g_abort{false};
+std::atomic<bool> g_busy{false};
+
 void TransmitNow(IRMitsubishiAC* ac, const MjAcState& state) {
+    if (g_abort.load()) {
+        return;
+    }
     ApplyState(ac, state);
     LogRawState(ac);
 
-    // Raise priority so software 38 kHz PWM is less often preempted.
+    g_busy.store(true);
     UBaseType_t prev = uxTaskPriorityGet(nullptr);
-    vTaskPrioritySet(nullptr, configMAX_PRIORITIES - 1);
+    vTaskPrioritySet(nullptr, kIrTxPrio);
     const int64_t t0 = esp_timer_get_time();
 
-    // First burst (includes library min-repeat). Then one extra full burst.
     ac->send();
     for (int i = 0; i < kExtraBurstCount; ++i) {
-        delay(kBurstGapMs);
+        if (g_abort.load()) {
+            ESP_LOGW(TAG, "IR TX aborted mid-burst");
+            break;
+        }
+        // Yieldable gap ? do not busy-wait 40ms at elevated prio.
+        vTaskDelay(pdMS_TO_TICKS(kBurstGapMs));
+        if (g_abort.load()) {
+            break;
+        }
         ac->send();
     }
 
     const int64_t dt = esp_timer_get_time() - t0;
     vTaskPrioritySet(nullptr, prev);
+    g_busy.store(false);
 
     ESP_LOGI(TAG,
-             "sendAc done protocol=%s bursts=%d in %lld us "
-             "(IR LED is infrared ù not visible to eye)",
+             "sendAc done protocol=%s bursts=%d in %lld us abort=%d",
              MitsubishiIrSender::ProtocolName(), 1 + kExtraBurstCount,
-             static_cast<long long>(dt));
+             static_cast<long long>(dt), g_abort.load() ? 1 : 0);
 }
-
-QueueHandle_t g_queue = nullptr;
-TaskHandle_t g_task = nullptr;
-IRMitsubishiAC* g_ac = nullptr;
 
 void IrWorkerTask(void* /*arg*/) {
     IrSendRequest req{};
@@ -116,14 +131,22 @@ void IrWorkerTask(void* /*arg*/) {
         if (xQueueReceive(g_queue, &req, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        if (g_abort.load()) {
+            // Drain leftovers while aborting.
+            while (xQueueReceive(g_queue, &req, 0) == pdTRUE) {
+            }
+            continue;
+        }
         if (g_ac == nullptr) {
             ESP_LOGW(TAG, "IR worker: AC object null");
             continue;
         }
-        // Coalesce: if more requests queued, keep only the latest state.
         IrSendRequest newest = req;
         while (xQueueReceive(g_queue, &req, 0) == pdTRUE) {
             newest = req;
+        }
+        if (g_abort.load()) {
+            continue;
         }
         ESP_LOGI(TAG, "IR worker TX protocol=%s power=%d temp=%u mode=%d fan=%d",
                  MitsubishiIrSender::ProtocolName(),
@@ -155,7 +178,6 @@ bool MitsubishiIrSender::Initialize() {
                   "and enable the matching SEND_* flag in CMakeLists.");
 
     if (ac_ == nullptr) {
-        // Cardputer ADV IR emitter on GPIO 44 (active-high via onboard driver).
         ac_ = new IRMitsubishiAC(CARDPUTER_IR_TX_GPIO, /*inverted=*/false,
                                  /*modulation=*/true);
     }
@@ -163,17 +185,18 @@ bool MitsubishiIrSender::Initialize() {
     auto* ac = AsAc(ac_);
     ac->begin();
     g_ac = ac;
+    g_abort.store(false);
 
     if (g_queue == nullptr) {
         g_queue = xQueueCreate(kIrQueueDepth, sizeof(IrSendRequest));
     }
     if (g_task == nullptr && g_queue != nullptr) {
-        // Dedicated task so keyboard ISR/task is never blocked by ~100 ms AC frames.
-        xTaskCreatePinnedToCore(IrWorkerTask, "mj_ir_tx", 4096, nullptr, 5, &g_task, 1);
+        // Pin to core 0 ? LVGL lives on core 1. Busy IR must never starve LVGL.
+        xTaskCreatePinnedToCore(IrWorkerTask, "mj_ir_tx", 4096, nullptr, kIrIdlePrio, &g_task, 0);
     }
 
     ready_ = (g_queue != nullptr && g_task != nullptr && ac_ != nullptr);
-    ESP_LOGI(TAG, "IR TX ready on GPIO %d protocol=%s ready=%d",
+    ESP_LOGI(TAG, "IR TX ready on GPIO %d protocol=%s ready=%d core=0",
              CARDPUTER_IR_TX_GPIO, ProtocolName(), static_cast<int>(ready_));
     return ready_;
 }
@@ -185,11 +208,11 @@ bool MitsubishiIrSender::Send(const MjAcState& state) {
     if (g_queue == nullptr) {
         return false;
     }
+    g_abort.store(false);
 
     IrSendRequest req{};
     req.state = state;
 
-    // Non-blocking: drop oldest if full so UI stays responsive.
     if (xQueueSend(g_queue, &req, 0) != pdTRUE) {
         IrSendRequest discarded{};
         xQueueReceive(g_queue, &discarded, 0);
@@ -202,4 +225,26 @@ bool MitsubishiIrSender::Send(const MjAcState& state) {
              ProtocolName(), state.power, state.temp_c,
              static_cast<int>(state.mode), static_cast<int>(state.fan));
     return true;
+}
+
+void MitsubishiIrSender::Cancel() {
+    g_abort.store(true);
+    if (g_queue != nullptr) {
+        IrSendRequest discarded{};
+        while (xQueueReceive(g_queue, &discarded, 0) == pdTRUE) {
+        }
+    }
+    // Wait briefly for in-flight frame to notice abort (between bursts).
+    for (int i = 0; i < 20 && g_busy.load(); ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (g_busy.load()) {
+        ESP_LOGW(TAG, "IR Cancel: still busy after wait (frame bit-bang)");
+    } else {
+        ESP_LOGI(TAG, "IR Cancel: queue drained, idle");
+    }
+}
+
+bool MitsubishiIrSender::IsBusy() const {
+    return g_busy.load();
 }

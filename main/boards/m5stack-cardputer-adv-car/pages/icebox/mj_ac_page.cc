@@ -407,6 +407,9 @@ void MjAcPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
 
 void MjAcPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
     active_ = false;
+    // Stop IR worker BEFORE any DisplayLock — bit-bang must not starve LVGL
+    // while ShowPage tries to enter Car/Spider/Launcher.
+    ir_.Cancel();
     if (display == nullptr || panel_ == nullptr) {
         return;
     }

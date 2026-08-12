@@ -3,7 +3,9 @@
 #include "cardputer_adv_lcd_display.h"
 #include "display/display.h"
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include <cstdio>
 #include <ctime>
@@ -16,6 +18,8 @@ namespace {
 constexpr lv_coord_t kScreenW = 240;
 constexpr lv_coord_t kScreenH = 135;
 
+// Pixel glyph (same shapes as before) drawn into ONE canvas — avoids creating
+// hundreds of lv_obj dots that exhausted internal heap / held DisplayLock too long.
 constexpr int kGlyphW = 5;
 constexpr int kGlyphH = 7;
 constexpr int kTimePx = 4;
@@ -24,7 +28,16 @@ constexpr int kDatePx = 2;
 constexpr int kDateGap = 2;
 constexpr int kTimeChars = 8;   // HH:MM:SS
 constexpr int kDateChars = 10;  // YYYY-MM-DD
-constexpr int kMaxDots = kGlyphW * kGlyphH;
+
+constexpr int kTimeCell = kGlyphW * kTimePx;
+constexpr int kDateCell = kGlyphW * kDatePx;
+// Pad width even so RGB565 row bytes (w*2) stay 4-byte aligned for LVGL canvas.
+constexpr int kCanvasWRaw = kTimeChars * kTimeCell + (kTimeChars - 1) * kTimeGap;  // 181
+constexpr int kCanvasW = (kCanvasWRaw + 1) & ~1;                                  // 182
+constexpr int kCanvasH = kGlyphH * kTimePx + 12 + kGlyphH * kDatePx;              // 54
+
+static_assert(kCanvasW == 182, "clock canvas width mismatch vs header");
+static_assert(kCanvasH == 54, "clock canvas height mismatch vs header");
 
 constexpr const char* kDigitGlyphs[11][kGlyphH] = {
     {"*****", "*...*", "*...*", "*...*", "*...*", "*...*", "*****"},
@@ -60,87 +73,37 @@ int GlyphIndex(char c) {
     return -1;
 }
 
-struct GlyphSlot {
-    lv_obj_t* dots[kMaxDots] = {};
-    int dot_count = 0;
-    char shown = '\0';
-};
-
-GlyphSlot g_time_slots[kTimeChars];
-GlyphSlot g_date_slots[kDateChars];
-
-void ClearSlot(GlyphSlot* slot) {
-    for (int i = 0; i < slot->dot_count; ++i) {
-        if (slot->dots[i] != nullptr) {
-            lv_obj_add_flag(slot->dots[i], LV_OBJ_FLAG_HIDDEN);
+void FillRect(uint16_t* buf, int stride, int x0, int y0, int w, int h, uint16_t color) {
+    for (int y = y0; y < y0 + h; ++y) {
+        if (y < 0 || y >= kCanvasH) {
+            continue;
+        }
+        uint16_t* row = buf + y * stride;
+        for (int x = x0; x < x0 + w; ++x) {
+            if (x >= 0 && x < kCanvasW) {
+                row[x] = color;
+            }
         }
     }
 }
 
-void EnsureDots(lv_obj_t* parent, GlyphSlot* slot, int need) {
-    while (slot->dot_count < need && slot->dot_count < kMaxDots) {
-        lv_obj_t* dot = lv_obj_create(parent);
-        StripStyles(dot);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(dot, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
-        slot->dots[slot->dot_count++] = dot;
-    }
-}
-
-void PaintGlyph(lv_obj_t* parent, GlyphSlot* slot, char c, int origin_x, int origin_y, int px) {
-    if (slot->shown == c) {
-        return;
-    }
-    slot->shown = c;
-    ClearSlot(slot);
-
+void PaintGlyphInto(uint16_t* buf, char c, int origin_x, int origin_y, int px) {
+    constexpr uint16_t kWhite = 0xFFFF;  // RGB565 white
     if (c == '-') {
-        EnsureDots(parent, slot, 3);
-        for (int i = 0; i < 3; ++i) {
-            lv_obj_t* dot = slot->dots[i];
-            lv_obj_set_size(dot, px, px);
-            lv_obj_set_pos(dot, origin_x + (i + 1) * px, origin_y + 3 * px);
-            lv_obj_clear_flag(dot, LV_OBJ_FLAG_HIDDEN);
-        }
+        FillRect(buf, kCanvasW, origin_x + px, origin_y + 3 * px, 3 * px, px, kWhite);
         return;
     }
-
     int gi = GlyphIndex(c);
     if (gi < 0) {
         return;
     }
-
-    int need = 0;
-    for (int r = 0; r < kGlyphH; ++r) {
-        for (int col = 0; col < kGlyphW; ++col) {
-            if (kDigitGlyphs[gi][r][col] == '*') {
-                ++need;
-            }
-        }
-    }
-    EnsureDots(parent, slot, need);
-
-    int di = 0;
     for (int r = 0; r < kGlyphH; ++r) {
         for (int col = 0; col < kGlyphW; ++col) {
             if (kDigitGlyphs[gi][r][col] != '*') {
                 continue;
             }
-            lv_obj_t* dot = slot->dots[di++];
-            lv_obj_set_size(dot, px, px);
-            lv_obj_set_pos(dot, origin_x + col * px, origin_y + r * px);
-            lv_obj_clear_flag(dot, LV_OBJ_FLAG_HIDDEN);
+            FillRect(buf, kCanvasW, origin_x + col * px, origin_y + r * px, px, px, kWhite);
         }
-    }
-}
-
-void ResetSlots() {
-    for (int i = 0; i < kTimeChars; ++i) {
-        g_time_slots[i] = {};
-    }
-    for (int i = 0; i < kDateChars; ++i) {
-        g_date_slots[i] = {};
     }
 }
 
@@ -153,10 +116,9 @@ void ClockPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     DisplayLockGuard lock(display);
     lv_obj_del(panel_);
     panel_ = nullptr;
-    time_label_ = nullptr;
-    date_label_ = nullptr;
+    canvas_ = nullptr;
     last_sec_ = -1;
-    ResetSlots();
+    last_drawn_[0] = '\0';
 }
 
 void ClockPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
@@ -164,7 +126,10 @@ void ClockPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
         return;
     }
 
-    ResetSlots();
+    ESP_LOGI(TAG, "BuildPanel canvas %dx%d buf=%u heap=%u", kCanvasW, kCanvasH,
+             static_cast<unsigned>(sizeof(canvas_buf_)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+
     DisplayLockGuard lock(display);
     panel_ = lv_obj_create(display->GetScreen());
     StripStyles(panel_);
@@ -173,55 +138,77 @@ void ClockPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     lv_obj_set_style_bg_color(panel_, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(panel_, LV_OPA_COVER, 0);
 
-    const int time_cell = kGlyphW * kTimePx;
-    const int time_w = kTimeChars * time_cell + (kTimeChars - 1) * kTimeGap;
-    const int time_h = kGlyphH * kTimePx;
-    time_label_ = lv_obj_create(panel_);
-    StripStyles(time_label_);
-    lv_obj_set_size(time_label_, time_w, time_h);
-    lv_obj_align(time_label_, LV_ALIGN_TOP_MID, 0, 36);
+    canvas_ = lv_canvas_create(panel_);
+    lv_canvas_set_buffer(canvas_, canvas_buf_, kCanvasW, kCanvasH, LV_COLOR_FORMAT_RGB565);
+    lv_obj_align(canvas_, LV_ALIGN_TOP_MID, 0, 36);
+    std::memset(canvas_buf_, 0, sizeof(canvas_buf_));
+    lv_obj_invalidate(canvas_);
+}
 
-    const int date_cell = kGlyphW * kDatePx;
-    const int date_w = kDateChars * date_cell + (kDateChars - 1) * kDateGap;
-    const int date_h = kGlyphH * kDatePx;
-    date_label_ = lv_obj_create(panel_);
-    StripStyles(date_label_);
-    lv_obj_set_size(date_label_, date_w, date_h);
-    lv_obj_align(date_label_, LV_ALIGN_TOP_MID, 0, 36 + time_h + 12);
+void ClockPage::DrawClock(const char* time_buf, const char* date_buf) {
+    if (canvas_ == nullptr) {
+        return;
+    }
+    // Skip redraw if identical string already painted (Tick may fire 10x/s).
+    char key[48];
+    std::snprintf(key, sizeof(key), "%s %s", time_buf, date_buf);
+    if (std::strcmp(key, last_drawn_) == 0) {
+        return;
+    }
+    std::strncpy(last_drawn_, key, sizeof(last_drawn_) - 1);
+    last_drawn_[sizeof(last_drawn_) - 1] = '\0';
+
+    std::memset(canvas_buf_, 0, sizeof(canvas_buf_));
+    for (int i = 0; i < kTimeChars; ++i) {
+        int x = i * (kTimeCell + kTimeGap);
+        PaintGlyphInto(canvas_buf_, time_buf[i], x, 0, kTimePx);
+    }
+    const int date_y = kGlyphH * kTimePx + 12;
+    for (int i = 0; i < kDateChars; ++i) {
+        int x = i * (kDateCell + kDateGap);
+        // Center date under time block.
+        const int date_w = kDateChars * kDateCell + (kDateChars - 1) * kDateGap;
+        const int x_off = (kCanvasW - date_w) / 2;
+        PaintGlyphInto(canvas_buf_, date_buf[i], x_off + x, date_y, kDatePx);
+    }
+    lv_obj_invalidate(canvas_);
 }
 
 void ClockPage::RefreshTime(CardputerAdvCarLcdDisplay* display) {
-    if (!active_ || panel_ == nullptr || display == nullptr) {
+    if (!active_ || panel_ == nullptr || display == nullptr || refreshing_) {
         return;
     }
+    refreshing_ = true;
 
+    const int64_t t0 = esp_timer_get_time();
     time_t now = time(nullptr);
     struct tm tm_now {};
     localtime_r(&now, &tm_now);
 
     if (tm_now.tm_sec == last_sec_) {
+        refreshing_ = false;
         return;
     }
     last_sec_ = tm_now.tm_sec;
 
-    char time_buf[32];
-    char date_buf[32];
+    char time_buf[16];
+    char date_buf[40];
     std::snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d", tm_now.tm_hour, tm_now.tm_min,
                   tm_now.tm_sec);
     std::snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02d", tm_now.tm_year + 1900,
                   tm_now.tm_mon + 1, tm_now.tm_mday);
 
-    DisplayLockGuard lock(display);
-    const int time_cell = kGlyphW * kTimePx;
-    for (int i = 0; i < kTimeChars; ++i) {
-        int x = i * (time_cell + kTimeGap);
-        PaintGlyph(time_label_, &g_time_slots[i], time_buf[i], x, 0, kTimePx);
+    // Short lock: buffer paint is CPU-only; only invalidate under LVGL lock.
+    {
+        DisplayLockGuard lock(display);
+        DrawClock(time_buf, date_buf);
     }
-    const int date_cell = kGlyphW * kDatePx;
-    for (int i = 0; i < kDateChars; ++i) {
-        int x = i * (date_cell + kDateGap);
-        PaintGlyph(date_label_, &g_date_slots[i], date_buf[i], x, 0, kDatePx);
-    }
+
+    const int64_t dt_us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG, "tick ok %s heap=%u dt_us=%lld", time_buf,
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<long long>(dt_us));
+    refreshing_ = false;
 }
 
 void ClockPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
@@ -230,25 +217,34 @@ void ClockPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     }
     display_ = display;
     active_ = true;
-    ESP_LOGI(TAG, "OnEnter clock reuse=%d", panel_ != nullptr ? 1 : 0);
+    refreshing_ = false;
+    ESP_LOGI(TAG, "OnEnter clock reuse=%d heap=%u", panel_ != nullptr ? 1 : 0,
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 
     BuildPanel(display);
     if (panel_ == nullptr) {
         ESP_LOGE(TAG, "BuildPanel failed");
+        active_ = false;
         return;
     }
     {
         DisplayLockGuard lock(display);
+        last_drawn_[0] = '\0';
         lv_obj_clear_flag(panel_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(panel_);
     }
+    // HideChatUi takes its own lock — never nest.
     display->HideChatUi();
     last_sec_ = -1;
     RefreshTime(display);
+    ESP_LOGI(TAG, "OnEnter done heap=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 }
 
 void ClockPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
+    ESP_LOGI(TAG, "OnLeave clock");
     active_ = false;
+    refreshing_ = false;
     if (display == nullptr || panel_ == nullptr) {
         return;
     }
@@ -257,5 +253,6 @@ void ClockPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
 }
 
 void ClockPage::Tick(CardputerAdvCarLcdDisplay* display) {
+    // Must stay short / non-blocking: runs on esp_timer task.
     RefreshTime(display);
 }

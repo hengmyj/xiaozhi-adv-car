@@ -9,14 +9,6 @@
 
 // ---------------------------------------------------------------------------
 // Target: 三菱电机 ZFJ 系列 MSZ-ZFJ12VA (KFR-36GW/BpU) aka ZFJ12
-//
-// MSZ-* wall-mount Mitsubishi Electric (not Heavy Industries) units in
-// IRremoteESP8266 SupportedProtocols.md overwhelmingly use MITSUBISHI_AC
-// (144-bit / IRMitsubishiAC): MSZ-FH, MSZ-GV, MSZ-SF, MSZ-ZW, …
-// ZFJ12 is the same MSZ wall-split family → default MITSUBISHI_AC.
-//
-// If the indoor unit ignores frames, try switching this constant to
-// MITSUBISHI112 (or MITSUBISHI136 for ducted) and rebuild.
 // ---------------------------------------------------------------------------
 enum class MjAcIrProtocol : uint8_t {
     MitsubishiAc = 0,    // MITSUBISHI_AC / IRMitsubishiAC (default for ZFJ12)
@@ -56,7 +48,10 @@ class MitsubishiIrSender {
 public:
     bool Initialize();
     bool Send(const MjAcState& state);
+    // Drain queue + abort in-flight TX. Must be fast — called from page OnLeave.
+    void Cancel();
     bool IsReady() const { return ready_; }
+    bool IsBusy() const;
     static const char* ProtocolName();
 
 private:

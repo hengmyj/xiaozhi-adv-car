@@ -30,6 +30,8 @@ public:
     lv_obj_t* GetRootPanel() const override { return panel_; }
 
     void NotifyLevel(float level);
+    void NotifyPlaying();
+    void SetStatusHint(const char* hint);
     bool IsStreamRunning() const;
     bool IsUserPaused() const;
     int StationIndex() const;
@@ -67,8 +69,9 @@ private:
     std::atomic<RadioPlayState> play_state_{RadioPlayState::Idle};
     std::atomic<bool> stream_run_{false};
     std::atomic<bool> user_paused_{false};
-    std::atomic<int> station_index_{0};
+    std::atomic<int> station_index_{1};  // default Music / FM974
     std::atomic<uint32_t> station_gen_{0};
     std::atomic<float> level_{0.0f};
+    char status_hint_[40] = {};
     TaskHandle_t stream_task_ = nullptr;
 };
