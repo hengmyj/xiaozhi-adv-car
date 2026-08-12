@@ -55,6 +55,6 @@ private:
     void ReleaseOtherExclusiveUi(PageId keep);
     // After Fn+1 Chat is fully shown (switching_ already false). Never from
     // Radio/Music OnLeave — Opus rebuild during exclusive teardown fragments
-    // no-PSRAM heap. Boot Initialize must not call this (codec_ still null).
+    // no-PSRAM heap. No-op until ReleaseAudioModels (boot must not RecycleDevice).
     void ScheduleChatAudioRestore(int retry = 0);
 };

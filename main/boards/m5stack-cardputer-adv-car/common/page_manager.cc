@@ -158,7 +158,8 @@ void PageManager::RecoverToChat(const char* reason) {
 
 void PageManager::ScheduleChatAudioRestore(int retry) {
     // Next main-loop tick: ShowPage has returned, switching_ is already false,
-    // Chat UI is on screen. Never call from Radio/Music OnLeave or Initialize.
+    // Chat UI is on screen. Never from Radio/Music OnLeave. No-op until
+    // ReleaseAudioModels — boot Initialize / first Chat must not RecycleDevice.
     Application::GetInstance().Schedule([this, retry]() {
         if (switching_) {
             if (retry < 2) {
@@ -185,6 +186,12 @@ void PageManager::ScheduleChatAudioRestore(int retry) {
         auto* codec = Board::GetInstance().GetAudioCodec();
         if (codec == nullptr) {
             ESP_LOGW(TAG, "Chat audio restore skipped: codec null");
+            return;
+        }
+        if (!audio.AudioModelsReleased()) {
+            ESP_LOGI(TAG,
+                     "Chat audio restore skipped: never released enc=%d dec=%d (boot-safe)",
+                     audio.HasOpusEncoder() ? 1 : 0, audio.HasOpusDecoder() ? 1 : 0);
             return;
         }
         ESP_LOGI(TAG,

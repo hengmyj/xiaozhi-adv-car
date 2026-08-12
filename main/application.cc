@@ -1121,9 +1121,8 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::RestoreAudioRouting() {
     // Drop any exclusive hold (Radio direct OutputData) so power-save + TTS
-    // can manage ES8311 again. Rebuild Opus only after an exclusive page
-    // Release — boot Initialize must not call this (codec_ still null).
-    // Called from PageManager::ScheduleChatAudioRestore after Chat is visible.
+    // can manage ES8311 again. RecycleDevice + Opus rebuild only after
+    // ReleaseAudioModels — boot Chat must keep the codec from Initialize.
     DeviceState state = GetDeviceState();
     auto* codec = Board::GetInstance().GetAudioCodec();
     ESP_LOGI(TAG,
@@ -1137,18 +1136,12 @@ void Application::RestoreAudioRouting() {
 
     audio_service_.SetExternalPlaybackActive(false);
     const bool was_released = audio_service_.AudioModelsReleased();
-    const bool need_recycle =
-        codec != nullptr &&
-        (was_released || !codec->input_enabled() || !codec->output_enabled());
-    if (need_recycle) {
-        // Recycle BEFORE rebuilding Opus so esp_codec_dev_new gets a contiguous
-        // block. Radio played TX without reading RX; EnableInput(true) would
-        // reuse the same IN_OUT handle whose RX DMA overflowed, so Read stalls
-        // and Chat stays in listening.
+    // RecycleDevice only after Radio/Music ReleaseAudioModels. Boot Chat must
+    // not close+I2S-disable a freshly initialized codec: input/output start
+    // off, so the old (!in || !out) gate recycled on first ShowChatUi and
+    // left RX dead while EnableInput looked successful.
+    if (was_released && codec != nullptr) {
         codec->RecycleDevice();
-    }
-
-    if (was_released || !audio_service_.HasOpusEncoder() || !audio_service_.HasOpusDecoder()) {
         audio_service_.RestoreAudioModels();
     }
 

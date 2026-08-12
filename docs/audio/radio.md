@@ -161,8 +161,8 @@ Radio 能播；**Fn+1 回到 Chat 后按 Enter 说话**，状态栏一直「聆�
 #### 修复
 
 - Radio/Music Leave：**不** `RestoreAudioModels`；`ReleaseAudioExclusive` **不再** `EnableInput(false)`（避免晚到的 join 把 Chat 的麦关掉）
-- `ShowPage(Chat)` 完成后 `ScheduleChatAudioRestore`：Chat UI 不可见时仍 Restore（只告警）；`switching_` 时最多再 defer 2 次
-- `RestoreAudioRouting`：**先** `RecycleDevice`（close+delete + I2S disable + 再 open）**再** 成对重建 encoder+decoder，然后按 DeviceState 重绑 VP
+- `ShowPage(Chat)` 完成后 `ScheduleChatAudioRestore`：Chat UI 不可见时仍 Restore（只告警）；`switching_` 时最多再 defer 2 次；**未 `ReleaseAudioModels` 则整段跳过**（开机 Chat 不得 RecycleDevice）
+- `RestoreAudioRouting`：仅 `was_released` 时 **先** `RecycleDevice`（close+delete + I2S disable + 再 open）**再** 成对重建 encoder+decoder，然后按 DeviceState 重绑 VP。勿用 `!input || !output` 当 Recycle 条件（开机 codec 本来就是关的）
 - 进入 listening 时若 encoder 仍空，再补一次 Restore；`EnableVoiceProcessing(true)` 同样会补
 
 串口对照（成功）：
@@ -177,6 +177,24 @@ Chat audio restore done ... enc=1 dec=1 in=1 out=1
 ```
 
 按 Enter 后应有 `listening: enc=1 dec=1 in=1 ... vp=1`，随后 `in_cnt` / `enc_cnt` 增加。若停在聆听：查是否出现 `Chat audio restore dropped`、`failed to re-open opus encoder`、`EnableVoiceProcessing: opus missing`、`Failed to encode audio: encoder not configured`。
+
+开机 Chat 串口应有 `Chat audio restore skipped: never released`（若误调了 Restore），**不应**出现 `RecycleDevice begin`。
+
+### 开机 Chat 听不到（3c90d98 回归）
+
+#### 现象
+
+刚烧录含 `RecycleDevice` 的固件后，**开机进 Chat 按 Enter 完全听不到**。此前开机 Chat 能对话；回归前的问题只是 Radio → Fn+1 Chat 卡在「聆听中」。
+
+#### 根因
+
+`RestoreAudioRouting` 用 `was_released || !input_enabled || !output_enabled` 决定是否 `RecycleDevice`。开机 codec 刚 `Initialize`，input/output 默认关，`models_released_` 为 false，但 `!in || !out` 仍为真。一旦 `ScheduleChatAudioRestore` 在开机路径跑到（ShowPage/Recover/误接 OnEnter），就会对**从未 Release、刚打开**的 ES8311 做 close+delete+I2S disable 再 open：RX 弄坏或时序错乱，`EnableInput` 看起来成功但读不到 PCM。
+
+#### 修复
+
+- `ScheduleChatAudioRestore`：未 `ReleaseAudioModels` 直接 return（开机 / Car / Launcher 回 Chat）
+- `RestoreAudioRouting`：`RecycleDevice` + `RestoreAudioModels` **仅** `was_released`
+- 开机 `PageManager::Initialize` 仍只 `ShowChatUi`，不走 Chat `OnEnter` Restore（避免 `codec_` 仍空时黑屏）
 
 ### Music → Launcher → Radio 仍无声
 
@@ -270,6 +288,6 @@ Car/IceBox 的 hidden 仪表盘才是 1–4→Radio 的主因；Clock/Matrix 对
 ## 遗留项
 
 - 稳定态仅剩 **15-20KB** 内部 SRAM，余量不宽裕。
-- 「进 Radio 再 Fn+1 回 Chat 说话」依赖 `ScheduleChatAudioRestore`：`RecycleDevice` + 成对重建 Opus encoder/decoder（独占页 Leave 不重建）；二次进 Radio 见上文「进出页二次进入无声」。
+- 「进 Radio 再 Fn+1 回 Chat 说话」依赖 `ScheduleChatAudioRestore`：仅曾经 `Release` 才 `RecycleDevice` + 成对重建 Opus；开机未 Release 跳过。二次进 Radio 见上文「进出页二次进入无声」。
 - 目前只验证 Music 台 `http://lhttp.qtfm.cn/live/332/64k.mp3`；News 台未逐项确认。
 - 24kHz 最近邻重采样高频有混叠，音质一般但可用。
