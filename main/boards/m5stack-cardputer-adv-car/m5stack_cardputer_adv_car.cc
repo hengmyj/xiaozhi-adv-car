@@ -185,15 +185,6 @@ private:
             target = PageId::Chat;
             matched = true;
         } else if (event.key_code == KC_2) {
-            target = PageId::Car;
-            matched = true;
-        } else if (event.key_code == KC_3) {
-            target = PageId::Spider;
-            matched = true;
-        } else if (event.key_code == KC_4) {
-            target = PageId::MjAc;
-            matched = true;
-        } else if (event.key_code == KC_5) {
             target = PageId::Launcher;
             matched = true;
         }

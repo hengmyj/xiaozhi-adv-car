@@ -15,7 +15,7 @@ m5stack-cardputer-adv-car/
     vehicle_control_page.* / emqx_* / car_state.h
     cardputer_adv_lcd_display.*
   pages/
-    launcher/                    # Fn+5 启动器（顶栏中央时间）
+    launcher/                    # Fn+2 启动器（顶栏中央时间）
     car/                         # 麦轮小车
     spider/                      # SpiderBot
     icebox/                      # 三菱空调 MJ（mj_ac_page）
@@ -34,10 +34,9 @@ m5stack-cardputer-adv-car/
   | 组合 | 页面 |
   |------|------|
   | **Fn+1** | 聊天（小智） |
-  | **Fn+2** | 麦轮小车 |
-  | **Fn+3** | SpiderBot |
-  | **Fn+4** | IceBox（三菱空调 MJ） |
-  | **Fn+5** | 启动器（Sparks 风格菜单，logo **点阵镂空 M + YJ**） |
+  | **Fn+2** | 启动器（Sparks 风格菜单，logo **点阵镂空 M + YJ**） |
+
+  Car / SpiderBot / IceBox 等仅从启动器数字键进入（见下表），**无** Fn+3/4/5 直切。
 
 - 启动器（ASCII 标签，避免中文乱码）按数字进入；顶栏中央显示系统时间（HH:MM:SS，SNTP）：
 

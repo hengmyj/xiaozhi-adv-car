@@ -138,7 +138,7 @@ v1 的稳定版本为 1.9.2，可以通过 `git checkout v1` 来切换到 v1 版
 
 - Broker：`broker-cn.emqx.io:1883`（浏览器可用 WS `8083` / WSS `8084`）
 - `car/cmd`：`{"run":0|1,"speed":0-100}`；`foc/cmd`：转向 `dir` `1`/`-1`；可选订阅 `car/state`
-- 按键：Fn+1 聊天 / Fn+2 麦轮 / Fn+3 蜘蛛 / Fn+4 三菱空调；车控页 `;` `.` `,` `/` 前进/停/左/右；空调页 P/M/F/;/. 即时发红外（S 强制重发）
+- 按键：Fn+1 聊天 / Fn+2 启动器（数字 1 Car / 2 Spider / 3 IceBox 等进入子页）；车控页 `;` `.` `,` `/` 前进/停/左/右；空调页 P/M/F/;/. 即时发红外（S 强制重发）
 
 详见 [docs/car-mqtt-control.md](docs/car-mqtt-control.md) 与 [板型 README](main/boards/m5stack-cardputer-adv-car/README_zh.md)。
 
