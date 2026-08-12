@@ -5,6 +5,7 @@
 
 #include <font_awesome.h>
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 
 #include <cstdio>
@@ -37,8 +38,8 @@ void StripStyles(lv_obj_t* obj) {
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICK_FOCUSABLE);
 }
 
-// Hollow dotted capital M — sized to sit on the same visual baseline as "YJ"
-// (BUILTIN_TEXT_FONT ~20px). Pitch 2 ? 14–18px glyph.
+// Hollow dotted capital M  sized to sit on the same visual baseline as "YJ"
+// (BUILTIN_TEXT_FONT ~20px). Pitch 2 ? 1418px glyph.
 constexpr int kMCols = 7;
 constexpr int kMRows = 9;
 constexpr const char* kMDots[kMRows] = {
@@ -218,7 +219,9 @@ void LauncherPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     }
     display_ = display;
     active_ = true;
-    ESP_LOGI(TAG, "OnEnter launcher (MYJ) reuse=%d", panel_ != nullptr ? 1 : 0);
+    ESP_LOGI(TAG, "OnEnter launcher (MYJ) reuse=%d heap=%u largest=%u", panel_ != nullptr ? 1 : 0,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     BuildPanel(display);
     if (panel_ == nullptr) {
@@ -233,6 +236,9 @@ void LauncherPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     display->HideChatUi();
     last_sec_ = -1;
     RefreshTime(display);
+    ESP_LOGI(TAG, "OnEnter launcher done heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void LauncherPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
@@ -242,6 +248,9 @@ void LauncherPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
     }
     DisplayLockGuard lock(display);
     lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
+    ESP_LOGI(TAG, "OnLeave launcher hidden heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void LauncherPage::Tick(CardputerAdvCarLcdDisplay* display) {

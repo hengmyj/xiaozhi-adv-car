@@ -12,6 +12,7 @@ class VehicleControlPage : public Page {
 public:
     void SetMqtt(EmqxCarMqtt* mqtt) { mqtt_ = mqtt; }
     lv_obj_t* GetRootPanel() const override { return panel_; }
+    void ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) override;
 
 protected:
     void EnterPage(CardputerAdvCarLcdDisplay* display, const char* title);
@@ -21,6 +22,7 @@ protected:
 
     virtual void BuildSceneGraphic(lv_obj_t* parent) = 0;
     virtual void UpdateSceneGraphic(int running) = 0;
+    virtual void ResetSceneWidgets() {}
     virtual int SceneAnimationIntervalUs() const { return 120000; }
 
     EmqxCarMqtt* mqtt_ = nullptr;

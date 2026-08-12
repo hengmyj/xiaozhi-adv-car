@@ -148,7 +148,7 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 
 ### Music → Launcher → Radio 仍无声
 
-Car 等页不碰麦，切 Radio 已可播；**只有经过 Music 再经 Launcher 进 Radio** 会失败。Music 没有 FFT / `SetReadSampleRate`，频谱是 512 sample 时域能量。真正占内部 SRAM 的是：
+Music 路径已修（DestroyPanel + 放麦）。**1–4 / 5 经 Launcher 进 Radio 仍会无声**——见下一节。原先只有经过 Music 再经 Launcher 进 Radio 会失败。Music 没有 FFT / `SetReadSampleRate`，频谱是 512 sample 时域能量。真正占内部 SRAM 的是：
 
 1. **`mic_buf_` 离页不释放**（512×2B），以及 24 根柱 + 网格的 LVGL 面板只 hidden、不 Destroy。Launcher 既不 Release 也不 Restore，Music 残留一直在；再叠 Radio 面板后最大空闲块不够 MP3 真解码。
 2. **Tick 在 `esp_timer` 上阻塞 `esp_codec_dev_read`**，主任务 `OnLeave` 可并发 `EnableInput(false)` 关掉 `dev_`（Read 原先不加锁）。未完成的 RX 会把 DMA/软件缓冲留在堆上。
@@ -162,6 +162,53 @@ Car 等页不碰麦，切 Radio 已可播；**只有经过 Music 再经 Launcher
 - Radio：`OnEnter` / Capture 打 free+largest；`open`/`process` 失败打 `MEM_LACK`（`ESP_AUDIO_ERR_MEM_LACK=-2`）并立刻放弃，不再空转 connecting
 
 串口对照：`OnLeave Music after mic release` → `after panel destroy` → `codec device closed+deleted` → Radio `OnEnter ... heap= ... largest=` → `mp3 decoder open ok` → `pcm chunks=`。
+
+
+### 1–4 / 5 → Launcher → Radio 无声
+
+启动器数字：1 Car / 2 SpiderBot / 3 IceBox / 4 Clock / 5 Rain / 6 Music / 7 Radio。
+
+**能播：** 6 Music → 导航(Launcher) → 7 Radio（Music Leave 已 DestroyPanel）
+**不能播（修前）：** 1–4 任意页 → 导航 → 7 Radio。5 Rain 同构（Matrix canvas），一并修。
+
+#### 根因
+
+PageManager `ShowPage` 对独占页 Leave **只 hidden、不 Destroy**（为防 IceBox→Car 同一次切页里 Destroy+重建卡死 LVGL）。经 Launcher 进 Radio 时，旧 panel 仍占内部 SRAM，再叠 Launcher（复用）+ Radio（24 柱），**最大空闲块**不够 MP3 真解码（`esp_audio_simple_dec_open` 仍可能成功，第一帧才 `MEM_LACK`）。
+
+MQTT 客户端开机常驻，离页不断开。IceBox IR worker（4KB 栈 + `IRMitsubishiAC`）第一次进页后常驻，`Cancel` 只停发送。Clock/Matrix 的 RGB565 **canvas 是成员 BSS**（Clock 182×54×2 ≈ 19.6KB，Matrix 120×68×2 ≈ 16.3KB），开机就占着，Destroy panel **腾不出**这块——只能释放 LVGL 对象。
+
+| 页 | 离页（修前） | 堆上大约（LVGL，进页才有） | 常驻（与是否进页无关） |
+|----|--------------|------------------------------|------------------------|
+| 1 Car | hidden | ~30 个对象（仪表盘+车身+轮辐），约 **8–15KB** | MQTT 客户端（全局） |
+| 2 Spider | hidden | ~24 个对象，约 **8–12KB** | 同上 MQTT |
+| 3 IceBox | hidden + IR Cancel | ~30 个对象（6 键×3 + 左右栏），约 **8–15KB** | 首次进页后 IR task 4KB 栈 |
+| 4 Clock | hidden | panel+canvas 对象约 **1–3KB** | canvas BSS **19.6KB** |
+| 5 Rain | hidden | 同上约 **1–3KB** | canvas BSS **16.3KB** |
+| 6 Music | DestroyPanel | 24 柱+网格，约 **10–15KB**（已释放） | — |
+| Launcher | hidden 复用 | MYJ 点阵+7 按钮，较重；Music→Radio 已证明 **可与 Radio 共存** | — |
+
+Car/IceBox 的 hidden 仪表盘才是 1–4→Radio 的主因；Clock/Matrix 对象虽小，hidden panel 仍碎片化最大块，故同样 Destroy。
+
+#### 修复
+
+- **Clock / Matrix**：`OnLeave` 一律 `DestroyPanel`（重建便宜；canvas BSS 仍在）
+- **Car / Spider / IceBox**：`PageManager` 在 Leave 之后调用 `ReleaseResidentUi`（`lv_obj_del`），**仅当下一页不是 Car/Spider/IceBox**。仪表盘互切仍复用 panel，避免 IceBox→Car 卡死回归
+- Launcher / Radio panel **继续复用**
+- 日志：各页 Leave 后 `heap`/`largest`；Radio `OnEnter` / Capture / `MEM_LACK`；`StartStream` 若 `largest < 20KB` 直接 `low memory`
+
+串口对照：`release resident UI` → `ReleaseResidentUi dashboard heap A->B largest C->D`（或 Clock/Matrix/IceBox `DestroyPanel`）→ Radio `OnEnter ... largest=` → `heap after capture` → `mp3 decoder open ok` → `pcm chunks=`。
+
+#### 测试矩阵
+
+- [ ] 1 Car → Launcher → 7 Radio
+- [ ] 2 Spider → Launcher → 7 Radio
+- [ ] 3 IceBox → Launcher → 7 Radio
+- [ ] 4 Clock → Launcher → 7 Radio
+- [ ] 5 Rain → Launcher → 7 Radio
+- [ ] 6 Music → Launcher → 7 Radio（回归仍能播）
+- [ ] 开机直进 7 Radio
+- [ ] Radio → Chat 语音仍可用
+- [ ] IceBox → Launcher → Car（切页不卡死）
 
 ## 遗留项
 

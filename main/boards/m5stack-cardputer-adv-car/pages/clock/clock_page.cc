@@ -113,12 +113,19 @@ void ClockPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ == nullptr || display == nullptr) {
         return;
     }
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t before_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     DisplayLockGuard lock(display);
     lv_obj_del(panel_);
     panel_ = nullptr;
     canvas_ = nullptr;
     last_sec_ = -1;
     last_drawn_[0] = '\0';
+    ESP_LOGI(TAG, "DestroyPanel clock heap %u->%u largest %u->%u (canvas BSS %u stays)",
+             (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)before_largest,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)sizeof(canvas_buf_));
 }
 
 void ClockPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
@@ -126,9 +133,10 @@ void ClockPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
         return;
     }
 
-    ESP_LOGI(TAG, "BuildPanel canvas %dx%d buf=%u heap=%u", kCanvasW, kCanvasH,
+    ESP_LOGI(TAG, "BuildPanel canvas %dx%d buf=%u heap=%u largest=%u", kCanvasW, kCanvasH,
              static_cast<unsigned>(sizeof(canvas_buf_)),
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
 
     DisplayLockGuard lock(display);
     panel_ = lv_obj_create(display->GetScreen());
@@ -218,8 +226,9 @@ void ClockPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     display_ = display;
     active_ = true;
     refreshing_ = false;
-    ESP_LOGI(TAG, "OnEnter clock reuse=%d heap=%u", panel_ != nullptr ? 1 : 0,
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+    ESP_LOGI(TAG, "OnEnter clock reuse=%d heap=%u largest=%u", panel_ != nullptr ? 1 : 0,
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
 
     BuildPanel(display);
     if (panel_ == nullptr) {
@@ -237,19 +246,22 @@ void ClockPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     display->HideChatUi();
     last_sec_ = -1;
     RefreshTime(display);
-    ESP_LOGI(TAG, "OnEnter done heap=%u",
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+    ESP_LOGI(TAG, "OnEnter done heap=%u largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
 }
 
 void ClockPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
-    ESP_LOGI(TAG, "OnLeave clock");
+    ESP_LOGI(TAG, "OnLeave clock heap=%u largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
     active_ = false;
     refreshing_ = false;
-    if (display == nullptr || panel_ == nullptr) {
-        return;
-    }
-    DisplayLockGuard lock(display);
-    lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
+    DestroyPanel(display);
+}
+
+void ClockPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    DestroyPanel(display);
 }
 
 void ClockPage::Tick(CardputerAdvCarLcdDisplay* display) {

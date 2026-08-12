@@ -13,6 +13,7 @@ class MatrixPage : public Page {
 public:
     void OnEnter(CardputerAdvCarLcdDisplay* display) override;
     void OnLeave(CardputerAdvCarLcdDisplay* display) override;
+    void ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) override;
     void Tick(CardputerAdvCarLcdDisplay* display);
     lv_obj_t* GetRootPanel() const override { return panel_; }
 

@@ -15,8 +15,27 @@ size_t FreeHeap() {
     return heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 }
 
+size_t LargestHeap() {
+    return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+}
+
 bool PanelVisible(lv_obj_t* panel) {
     return panel != nullptr && !lv_obj_has_flag(panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+bool IsDashboardPage(PageId id) {
+    return id == PageId::Car || id == PageId::Spider || id == PageId::MjAc;
+}
+
+// Keep Car/Spider/IceBox panels when switching among them (IceBox→Car used to
+// freeze LVGL). Clock/Matrix/dashboards going to Launcher/Chat/Radio must drop
+// the hidden panel so MP3 can get a contiguous internal-SRAM block.
+bool ShouldReleaseResidentUi(PageId from, PageId to) {
+    if (IsDashboardPage(from) && IsDashboardPage(to)) {
+        return false;
+    }
+    return from == PageId::Car || from == PageId::Spider || from == PageId::MjAc ||
+           from == PageId::Clock || from == PageId::Matrix;
 }
 
 }  // namespace
@@ -79,13 +98,15 @@ Page* PageManager::GetPage(PageId id) {
 }
 
 void PageManager::RecoverToChat(const char* reason) {
-    ESP_LOGE(TAG, "RecoverToChat: %s (was page %d) heap=%u", reason, static_cast<int>(current_),
-             static_cast<unsigned>(FreeHeap()));
+    ESP_LOGE(TAG, "RecoverToChat: %s (was page %d) heap=%u largest=%u", reason,
+             static_cast<int>(current_), static_cast<unsigned>(FreeHeap()),
+             static_cast<unsigned>(LargestHeap()));
     Page* stuck = GetPage(current_);
     if (stuck != nullptr && current_ != PageId::Chat) {
         // OnLeave first (Music drops mic; Radio stops stream; hide failed panel).
         // Opus rebuild happens in Chat OnEnter → RestoreAudioRouting.
         stuck->OnLeave(display_);
+        stuck->ReleaseResidentUi(display_);
     }
     current_ = PageId::Chat;
     chat_page_.OnEnter(display_);
@@ -123,8 +144,9 @@ void PageManager::ShowPage(PageId id) {
 
     switching_ = true;
     const PageId prev = current_;
-    ESP_LOGI(TAG, "ShowPage enter %d -> %d heap=%u", static_cast<int>(prev), static_cast<int>(id),
-             static_cast<unsigned>(FreeHeap()));
+    ESP_LOGI(TAG, "ShowPage enter %d -> %d heap=%u largest=%u", static_cast<int>(prev),
+             static_cast<int>(id), static_cast<unsigned>(FreeHeap()),
+             static_cast<unsigned>(LargestHeap()));
 
     if (id == PageId::Chat && mqtt_ != nullptr && mqtt_->run() != 0) {
         mqtt_->PublishCarCmd(0, mqtt_->speed());
@@ -134,6 +156,14 @@ void PageManager::ShowPage(PageId id) {
     // still enters first so HideChatUi never leaves a WiFi-only blank frame.
     if (prev != PageId::Chat) {
         current->OnLeave(display_);
+        if (ShouldReleaseResidentUi(prev, id)) {
+            ESP_LOGI(TAG, "release resident UI %d before %d heap=%u largest=%u",
+                     static_cast<int>(prev), static_cast<int>(id),
+                     static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
+            current->ReleaseResidentUi(display_);
+            ESP_LOGI(TAG, "released resident UI %d heap=%u largest=%u", static_cast<int>(prev),
+                     static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
+        }
         current_ = id;
         next->OnEnter(display_);
     } else {
@@ -146,7 +176,8 @@ void PageManager::ShowPage(PageId id) {
         if (!display_->IsChatUiVisible()) {
             RecoverToChat("chat UI still hidden after switch to Chat");
             switching_ = false;
-            ESP_LOGI(TAG, "ShowPage leave (recovered) heap=%u", static_cast<unsigned>(FreeHeap()));
+            ESP_LOGI(TAG, "ShowPage leave (recovered) heap=%u largest=%u",
+                     static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
             return;
         }
     } else {
@@ -154,7 +185,8 @@ void PageManager::ShowPage(PageId id) {
         if (!PanelVisible(panel)) {
             RecoverToChat("next page panel null/hidden after OnEnter");
             switching_ = false;
-            ESP_LOGI(TAG, "ShowPage leave (recovered) heap=%u", static_cast<unsigned>(FreeHeap()));
+            ESP_LOGI(TAG, "ShowPage leave (recovered) heap=%u largest=%u",
+                     static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
             return;
         }
         // Keep exclusive panel above any chat chrome that UpdateStatusBar may touch.
@@ -162,8 +194,9 @@ void PageManager::ShowPage(PageId id) {
         lv_obj_move_foreground(panel);
     }
 
-    ESP_LOGI(TAG, "ShowPage leave %d -> %d ok heap=%u", static_cast<int>(prev),
-             static_cast<int>(current_), static_cast<unsigned>(FreeHeap()));
+    ESP_LOGI(TAG, "ShowPage leave %d -> %d ok heap=%u largest=%u", static_cast<int>(prev),
+             static_cast<int>(current_), static_cast<unsigned>(FreeHeap()),
+             static_cast<unsigned>(LargestHeap()));
     switching_ = false;
 }
 

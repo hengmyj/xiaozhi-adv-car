@@ -3,9 +3,13 @@
 #include "cardputer_adv_lcd_display.h"
 #include "display/display.h"
 
+#include <esp_heap_caps.h>
+#include <esp_log.h>
 #include <esp_timer.h>
 
 #include <cstdio>
+
+#define TAG "VehiclePage"
 
 namespace {
 
@@ -80,8 +84,13 @@ void VehicleControlPage::BuildDashboard(CardputerAdvCarLcdDisplay* display, cons
         return;
     }
 
-    DisplayLockGuard lock(display);
-    panel_ = lv_obj_create(display->GetScreen());
+    ESP_LOGI(TAG, "BuildDashboard start heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    {
+        DisplayLockGuard lock(display);
+        panel_ = lv_obj_create(display->GetScreen());
     lv_obj_set_size(panel_, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_style_radius(panel_, 0, 0);
     lv_obj_set_style_border_width(panel_, 0, 0);
@@ -166,6 +175,41 @@ void VehicleControlPage::BuildDashboard(CardputerAdvCarLcdDisplay* display, cons
     lv_label_set_text(dir_right_, LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_color(dir_right_, lv_color_hex(0x333355), 0);
     lv_obj_align(dir_right_, LV_ALIGN_CENTER, 18, 0);
+    }
+
+    ESP_LOGI(TAG, "BuildDashboard done heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+void VehicleControlPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    if (panel_ == nullptr || display == nullptr) {
+        return;
+    }
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t before_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    {
+        DisplayLockGuard lock(display);
+        lv_obj_del(panel_);
+        panel_ = nullptr;
+        scene_ = nullptr;
+        speed_arc_ = nullptr;
+        speed_label_ = nullptr;
+        run_dot_ = nullptr;
+        dir_left_ = nullptr;
+        dir_center_ = nullptr;
+        dir_right_ = nullptr;
+        mqtt_signal_ = nullptr;
+        mqtt_tower_top_ = nullptr;
+        for (int i = 0; i < 4; ++i) {
+            mqtt_bars_[i] = nullptr;
+        }
+        ResetSceneWidgets();
+    }
+    ESP_LOGI(TAG, "ReleaseResidentUi dashboard heap %u->%u largest %u->%u",
+             (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)before_largest,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void VehicleControlPage::RefreshDashboard() {
@@ -238,6 +282,9 @@ void VehicleControlPage::EnterPage(CardputerAdvCarLcdDisplay* display, const cha
     local_dir_ = mqtt_->dir();
     DisplayLockGuard lock(display);
     RefreshDashboard();
+    ESP_LOGI(TAG, "EnterPage done heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void VehicleControlPage::LeavePage(CardputerAdvCarLcdDisplay* display) {
@@ -247,6 +294,9 @@ void VehicleControlPage::LeavePage(CardputerAdvCarLcdDisplay* display) {
 
     DisplayLockGuard lock(display);
     lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
+    ESP_LOGI(TAG, "LeavePage hidden heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void VehicleControlPage::TickPage(CardputerAdvCarLcdDisplay* display) {
