@@ -17,7 +17,7 @@ Cardputer ADV 小智 fork + 多页启动器。
 - 硬件：Cardputer ADV（S3FN8、8MB、无 PSRAM）；板型/OTA `m5stack-cardputer-adv-car`
 - 页面与按键：[docs/architecture/pages-and-keys.md](docs/architecture/pages-and-keys.md)；MQTT：[docs/mqtt/car-mqtt-control.md](docs/mqtt/car-mqtt-control.md)
 - 键盘配网：`wifi_config_ui` 用 overlay，禁止 `lv_obj_clean(lv_scr_act())`；W/S 等重操作经 `Application::Schedule` 到主任务，否则易重启
-- Radio：OnEnter 勿阻塞；流媒体异步 + `CaptureAudioExclusive`/`RestoreAudioRouting`；无 PSRAM 下 HLS/AAC/TLS 过重，只走 HTTP MP3 低码率。二次进页无声见 [docs/audio/radio.md](docs/audio/radio.md)「进出页二次进入无声」
+- Radio：OnEnter 勿阻塞；流媒体异步 + `CaptureAudioExclusive`；离独占页勿立刻 `RestoreAudioModels`（Chat `RestoreAudioRouting` 再重建）；无 PSRAM 下只走 HTTP MP3 低码率。Radio↔Car/Music 二次无声见 [docs/audio/radio.md](docs/audio/radio.md)「进出页二次进入无声」
 - 音频内存（无 PSRAM）：进 Radio 仅剩 27KB → MP3 解码器 `MEM_LACK`；`AudioService` 常驻 Opus 占 43KB，`ReleaseAudioModels()` 后回到 70KB。本板 `CONFIG_WAKE_WORD_DISABLED=y` 无 AFE，释放唤醒词模型无效
 - `esp_audio_simple_dec_open()` 惰性：只占 148B 即返回成功，真解码器等第一帧才分配——「open 成功」≠ 能解码
 - Radio 流任务必须 **core 0 / prio 3**（`taskLVGL` 在 core1/prio1，抢了就触发 `task_wdt: CPU 1: taskLVGL`）

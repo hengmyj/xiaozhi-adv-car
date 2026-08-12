@@ -119,32 +119,35 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 ### 现象
 
 - 开机直接进 Radio → 可播放
-- 离开 Radio 再进（任意中间页）→ 无声 / 一直 connecting / `low memory`
+- **从 Car / Music / Launcher 切回 Radio** → 无声 / 一直 connecting / `low memory`
+- 离开后再回 Chat，TTS/语音应仍可用
 
-### 根因
+### 根因（两层）
 
-无 PSRAM 板上 MP3 解码器与 Opus 不能同时常驻。旧实现里 `StopStream` 在 `esp_http_client` 阻塞（open/read，超时 6s）时只等 **4s** 就：
+1. **HTTP 僵尸任务（旧）**：`StopStream` 在 `esp_http_client` 阻塞时过早清空句柄并 `RestoreAudioModels`，MP3 与 Opus 双占用把无 PSRAM 堆吃光。已用 `AbortActiveHttp` + 严格 join + `enter_gen_` 处理。
 
-1. 把 `stream_task_` 置空（任务实际还活着）
-2. `ReleaseAudioExclusive` → `RestoreAudioModels()` 重建 Opus（~43KB）
-
-僵尸 `StreamTask` 仍占着 MP3 解码器与 HTTP 缓冲。再次进页时 `ReleaseAudioModels` 即使再次释放 Opus，堆也已被碎片/双占用吃掉，解码器开不起来或开流被拒。
-
-次要问题：`OnEnter` 的 `Schedule(StartStream)` 仅看 `active_`，快切页时旧回调可能在新一次进入后误触发/乱序。
+2. **独占页互切仍 Rebuild Opus（本次主因）**：用户路径是 Radio ↔ Car / Music，不是单纯 Radio→Chat。旧逻辑在 **每次** Radio `OnLeave` 都 `RestoreAudioModels`（~43KB），下一页（Car 不占音频；Music 只抢麦）根本用不到 Opus；再进 Radio 又 `Release`。无 PSRAM 上这轮 Restore→Release **碎片化最大空闲块**，二次进页 MP3 真解码（首帧分配）失败或开流被拒。Music `OnLeave` 再调 `RestoreAudioRouting` 会加重：重建 Opus + 可能留下 `EnableInput(true)` 的 duplex RX。
 
 ### 修复（`fix/radio-reenter-audio`）
 
-- `AbortActiveHttp()`：离页时 `esp_http_client_close` 打断阻塞，尽快 join
-- join 上限改为 `kHttpTimeoutMs + 2000`；**超时绝不提前 Restore Opus**，也不清空未退出的 `stream_task_`
-- `enter_gen_`：作废离开前排队的 `StartStream`
-- `StartStream` 若发现上一次任务未死，先 drain 再 `CaptureAudioExclusive`
-- `CaptureAudioExclusive` 每次都重新 `ReleaseAudioModels`（幂等），并打 free/largest 堆日志
+**流任务 / join（保留）**
 
-串口应能看到：`OnLeave` → `AbortActiveHttp` / `WaitStreamExit` → `audio exclusive OFF` → 再进 `OnEnter gen=…` → `released audio models` → `mp3 decoder open ok` → `pcm chunks=…`。
+- `AbortActiveHttp()` + join 上限 `kHttpTimeoutMs + 2000`；超时不提前 Restore Opus
+- `enter_gen_` 作废陈旧 `StartStream`；`StartStream` 先 drain 残留任务
+
+**独占页音频状态机（本次）**
+
+- Radio `ReleaseAudioExclusive`：**只**关掉 `SetExternalPlaybackActive` / 关 input，**不** `RestoreAudioModels`
+- Music `ReleaseMicExclusive`：`EnableInput(false)`，**不** `RestoreAudioRouting`
+- `Application::RestoreAudioRouting`（Chat `OnEnter`）：统一 `RestoreAudioModels` + 按设备状态重绑唤醒词/拾音
+- Radio `CaptureAudioExclusive`：强制 `EnableInput(false)` + `ReleaseAudioModels`（幂等）+ 外部播放 hold
+- `ReleaseAudioModels` 先清空编解码队列，再关 Opus，避免队列缓冲残留占堆
+
+串口应能看到：`OnLeave` → `audio exclusive OFF (models deferred)` →（Car/Music 无 Opus restore）→ 再进 `OnEnter` → `released audio models`（常为 enc=0 dec=0）→ `mp3 decoder open ok` → `self-test tone` → `pcm chunks=…`。回 Chat 时应有 `RestoreAudioRouting` + `restored audio models`。
 
 ## 遗留项
 
 - 稳定态仅剩 **15-20KB** 内部 SRAM，余量不宽裕。
-- 「进 Radio 到离页再聊天语音」依赖离页 `RestoreAudioModels`；二次进 Radio 见上文「进出页二次进入无声」。
+- 「进 Radio 到离页再聊天语音」依赖 Chat `RestoreAudioRouting`→`RestoreAudioModels`（独占页互切不再离页重建）；二次进 Radio 见上文「进出页二次进入无声」。
 - 目前只验证 Music 台 `http://lhttp.qtfm.cn/live/332/64k.mp3`；News 台未逐项确认。
 - 24kHz 最近邻重采样高频有混叠，音质一般但可用。

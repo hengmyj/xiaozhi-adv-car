@@ -624,14 +624,26 @@ void AudioService::ReleaseAudioModels() {
         audio_processor_->Deinitialize();
         audio_processor_initialized_ = false;
     }
-    // The Opus pair stays open for the whole app lifetime and is the single largest
-    // reclaimable block. An exclusive-audio page speaks to the codec directly and
-    // needs neither, so hand the memory over and rebuild them on the way out.
+    // Drop queued PCM/Opus payloads before closing codecs so their buffers return
+    // to the heap as one contiguous reclaim with the Opus pair.
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        timestamp_queue_.clear();
+        audio_encode_queue_.clear();
+        audio_decode_queue_.clear();
+        audio_playback_queue_.clear();
+        audio_testing_queue_.clear();
+        audio_send_queue_.clear();
+        audio_queue_cv_.notify_all();
+    }
+    // The Opus pair is the single largest reclaimable block. Exclusive pages talk
+    // to the codec directly and need neither; Chat rebuilds via RestoreAudioModels.
     if (had_enc) {
         esp_opus_enc_close(opus_encoder_);
         opus_encoder_ = nullptr;
     }
     if (had_dec) {
+        std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
         esp_opus_dec_close(opus_decoder_);
         opus_decoder_ = nullptr;
     }

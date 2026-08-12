@@ -1120,9 +1120,12 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 }
 
 void Application::RestoreAudioRouting() {
-    // Drop any exclusive hold (Radio HLS direct OutputData) so power-save + TTS
-    // can manage ES8311 again.
+    // Drop any exclusive hold (Radio direct OutputData) so power-save + TTS
+    // can manage ES8311 again. Rebuild Opus here — exclusive pages (Radio/Music)
+    // deliberately leave models released so Radio↔Car/Music does not pay a
+    // Restore→Release heap thrash that fragments the no-PSRAM SRAM.
     audio_service_.SetExternalPlaybackActive(false);
+    audio_service_.RestoreAudioModels();
 
     DeviceState state = GetDeviceState();
     switch (state) {

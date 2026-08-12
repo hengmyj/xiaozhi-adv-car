@@ -783,16 +783,15 @@ void RadioPage::CaptureAudioExclusive() {
     auto& audio = Application::GetInstance().GetAudioService();
     audio.EnableWakeWordDetection(false);
     audio.EnableVoiceProcessing(false);
-    // Always re-run Release: a prior StopStream that timed out may have left
-    // audio_exclusive_ stuck true while Opus was already freed — or the opposite
-    // after Chat restored routing. ReleaseAudioModels is idempotent when null.
+    // Always re-run Release: Opus may already be freed after a prior Radio visit
+    // (we no longer restore on exclusive leave), or Chat may have rebuilt them.
+    // ReleaseAudioModels is idempotent when null.
     const size_t before = InternalHeapFree();
     const size_t before_largest = InternalHeapLargest();
     audio.ReleaseAudioModels();
     const size_t after = InternalHeapFree();
     const size_t after_largest = InternalHeapLargest();
-    // This is the only thing that should touch codec power: it enables output and
-    // pins it on for as long as the hold is active.
+    // Hold TX on; force RX off so a leftover Music mic path cannot stall duplex I2S.
     audio.SetExternalPlaybackActive(true);
     if (audio_exclusive_) {
         ESP_LOGW(TAG, "audio exclusive re-assert heap %u->%u largest %u->%u", (unsigned)before,
@@ -805,6 +804,10 @@ void RadioPage::CaptureAudioExclusive() {
 
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
+        codec->EnableInput(false);
+        if (!codec->output_enabled()) {
+            codec->EnableOutput(true);
+        }
         codec->SetOutputVolume(kDefaultVolume);
         ESP_LOGI(TAG, "codec vol=%d out=%d in=%d rate=%d", codec->output_volume(),
                  codec->output_enabled() ? 1 : 0, codec->input_enabled() ? 1 : 0,
@@ -813,19 +816,26 @@ void RadioPage::CaptureAudioExclusive() {
 }
 
 void RadioPage::ReleaseAudioExclusive() {
+    // Soft release only: clear the TX hold and drop the exclusive flag. Do NOT
+    // RestoreAudioModels / RestoreAudioRouting here — Radio↔Car/Music would
+    // rebuild Opus (~43KB) just to free it again on the next Radio enter, and
+    // that thrash fragments the no-PSRAM heap so MP3 open/decode fails silently.
+    // Chat OnEnter → RestoreAudioRouting() rebuilds Opus when TTS is needed.
     if (!audio_exclusive_) {
+        Application::GetInstance().GetAudioService().SetExternalPlaybackActive(false);
         ESP_LOGI(TAG, "audio exclusive OFF (already clear) heap=%u",
                  (unsigned)InternalHeapFree());
         return;
     }
     audio_exclusive_ = false;
-    auto& app = Application::GetInstance();
-    app.GetAudioService().SetExternalPlaybackActive(false);
-    // Rebuild the Opus codecs before the chat path can need them again.
-    app.GetAudioService().RestoreAudioModels();
-    app.RestoreAudioRouting();
-    ESP_LOGI(TAG, "audio exclusive OFF heap=%u largest=%u", (unsigned)InternalHeapFree(),
-             (unsigned)InternalHeapLargest());
+    auto& audio = Application::GetInstance().GetAudioService();
+    audio.SetExternalPlaybackActive(false);
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec != nullptr) {
+        codec->EnableInput(false);
+    }
+    ESP_LOGI(TAG, "audio exclusive OFF (models deferred) heap=%u largest=%u",
+             (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest());
 }
 
 void RadioPage::StreamTask(void* arg) {

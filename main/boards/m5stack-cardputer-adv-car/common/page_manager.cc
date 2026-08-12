@@ -77,7 +77,8 @@ void PageManager::RecoverToChat(const char* reason) {
              static_cast<unsigned>(FreeHeap()));
     Page* stuck = GetPage(current_);
     if (stuck != nullptr && current_ != PageId::Chat) {
-        // OnLeave first (Music restores mic/AFE; Radio stops stream; hide failed panel).
+        // OnLeave first (Music drops mic; Radio stops stream; hide failed panel).
+        // Opus rebuild happens in Chat OnEnter → RestoreAudioRouting.
         stuck->OnLeave(display_);
     }
     current_ = PageId::Chat;

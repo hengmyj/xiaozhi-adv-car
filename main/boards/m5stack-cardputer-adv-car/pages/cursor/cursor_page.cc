@@ -140,10 +140,14 @@ void CursorPage::ReleaseMicExclusive() {
     mic_exclusive_ = false;
     saved_wake_word_ = false;
     saved_voice_proc_ = false;
-    // Re-sync Application wake-word / voice for current device state (do not
-    // blindly restore saved flags — that desyncs Idle vs Listening).
-    Application::GetInstance().RestoreAudioRouting();
-    ESP_LOGI(TAG, "mic exclusive released + RestoreAudioRouting");
+    // Drop the mic path only. Do NOT RestoreAudioRouting here: that rebuilds Opus
+    // and re-arms wake-word, which fights Radio re-enter (heap thrash + duplex RX
+    // left on). Chat OnEnter calls RestoreAudioRouting when TTS/voice is needed.
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec != nullptr) {
+        codec->EnableInput(false);
+    }
+    ESP_LOGI(TAG, "mic exclusive released (input off, routing deferred to Chat)");
 }
 
 void CursorPage::CaptureMic() {
