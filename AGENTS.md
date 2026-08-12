@@ -10,6 +10,7 @@ Cardputer ADV 小智 fork + 多页启动器。
 - Cardputer ADV 页面：Fn 仅用于切页；页内车控/IR 键无需 Fn；红外按键即时发码（无需 Enter）
 - Cardputer 已有键盘：配网优先机上扫列表+输密码，勿默认依赖 SoftAP/手机网页配网
 - `./flash.sh` + `./monitor.sh`（Radio 改 8m 分区表需整包烧录）；卡住监视器用 `./monitor.sh kill` 或 Ctrl+]
+- `./monitor.sh` 必须在 Cursor 本机终端跑（idf_monitor 要 TTY）；Agent 无 TTY 会直接拒绝，勿在对话里硬跑。包装脚本不可用 stdin heredoc（会把 TTY 变成管道）
 - 不宜 ESP-Brookesia；构建 ESP-IDF ≥5.4（`~/.espressif/v5.5.3/esp-idf`）
 
 ## Learned Workspace Facts
@@ -17,7 +18,7 @@ Cardputer ADV 小智 fork + 多页启动器。
 - 硬件：Cardputer ADV（S3FN8、8MB、无 PSRAM）；板型/OTA `m5stack-cardputer-adv-car`
 - 页面与按键：[docs/architecture/pages-and-keys.md](docs/architecture/pages-and-keys.md)；MQTT：[docs/mqtt/car-mqtt-control.md](docs/mqtt/car-mqtt-control.md)
 - 键盘配网：`wifi_config_ui` 用 overlay，禁止 `lv_obj_clean(lv_scr_act())`；W/S 等重操作经 `Application::Schedule` 到主任务，否则易重启
-- Radio：OnEnter 勿阻塞；流媒体异步 + `CaptureAudioExclusive`；离独占页勿立刻 `RestoreAudioModels`（Chat `RestoreAudioRouting` 仅在曾经 `Release` 后才重建）；开机 `PageManager::Initialize` 只 `ShowChatUi`，勿走 Chat `OnEnter`（此时 `AudioService::codec_` 仍为空）。无 PSRAM 下只走 HTTP MP3 低码率。Radio↔Car/Music 二次无声见 [docs/audio/radio.md](docs/audio/radio.md)「进出页二次进入无声」
+- Radio：OnEnter 勿阻塞；流媒体异步 + `CaptureAudioExclusive`；离独占页勿立刻 `RestoreAudioModels`（Chat `RestoreAudioRouting` 仅在曾经 `Release` 后才重建）；开机 `PageManager::Initialize` 只 `ShowChatUi`，勿走 Chat `OnEnter`（此时 `AudioService::codec_` 仍为空）。无 PSRAM 下只走 HTTP MP3 低码率。Radio↔Car/Music 二次无声见 [docs/audio/radio.md](docs/audio/radio.md)「进出页二次进入无声」。Music Leave 须关麦、释放 mic_buf_ 并 DestroyPanel（Launcher 不 Restore）；勿在 esp_timer Tick 里并发 close codec
 - 音频内存（无 PSRAM）：进 Radio 仅剩 27KB → MP3 解码器 `MEM_LACK`；`AudioService` 常驻 Opus 占 43KB，`ReleaseAudioModels()` 后回到 70KB。本板 `CONFIG_WAKE_WORD_DISABLED=y` 无 AFE，释放唤醒词模型无效
 - `esp_audio_simple_dec_open()` 惰性：只占 148B 即返回成功，真解码器等第一帧才分配——「open 成功」≠ 能解码
 - Radio 流任务必须 **core 0 / prio 3**（`taskLVGL` 在 core1/prio1，抢了就触发 `task_wdt: CPU 1: taskLVGL`）

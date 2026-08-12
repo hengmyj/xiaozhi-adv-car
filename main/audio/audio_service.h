@@ -143,6 +143,10 @@ public:
     // Direct codec playback (e.g. Radio HLS): hold ES8311 TX so power-save cannot mute.
     void SetExternalPlaybackActive(bool active);
     void NotifyOutputActivity();
+    // Music (and other direct InputData paths): keep last_input_time_ fresh so the
+    // audio-power timer does not EnableInput(false) mid-capture and reopen the
+    // duplex device (heap churn on no-PSRAM).
+    void NotifyInputActivity();
 
 private:
     AudioCodec* codec_ = nullptr;

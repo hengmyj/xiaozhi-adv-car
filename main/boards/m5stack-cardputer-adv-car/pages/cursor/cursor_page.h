@@ -4,6 +4,7 @@
 
 #include <lvgl.h>
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -22,6 +23,7 @@ private:
     void UpdateBars(CardputerAdvCarLcdDisplay* display);
     void CaptureMic();
     void ReleaseMicExclusive();
+    void FreeMicBuffer();
 
     static constexpr int kBarCount = 24;
     static constexpr int kMicSamples = 512;
@@ -31,6 +33,7 @@ private:
     bool mic_exclusive_ = false;
     bool saved_wake_word_ = false;
     bool saved_voice_proc_ = false;
+    std::atomic<bool> capturing_{false};
 
     lv_obj_t* panel_ = nullptr;
     lv_obj_t* bars_[kBarCount] = {};

@@ -146,6 +146,23 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 
 串口应能看到：`OnLeave` → `audio exclusive OFF (models deferred)` →（Car/Music 无 Opus restore）→ 再进 `OnEnter` → `released audio models`（常为 enc=0 dec=0）→ `mp3 decoder open ok` → `self-test tone` → `pcm chunks=…`。回 Chat 时应有 `RestoreAudioRouting` + `restored audio models`。
 
+### Music → Launcher → Radio 仍无声
+
+Car 等页不碰麦，切 Radio 已可播；**只有经过 Music 再经 Launcher 进 Radio** 会失败。Music 没有 FFT / `SetReadSampleRate`，频谱是 512 sample 时域能量。真正占内部 SRAM 的是：
+
+1. **`mic_buf_` 离页不释放**（512×2B），以及 24 根柱 + 网格的 LVGL 面板只 hidden、不 Destroy。Launcher 既不 Release 也不 Restore，Music 残留一直在；再叠 Radio 面板后最大空闲块不够 MP3 真解码。
+2. **Tick 在 `esp_timer` 上阻塞 `esp_codec_dev_read`**，主任务 `OnLeave` 可并发 `EnableInput(false)` 关掉 `dev_`（Read 原先不加锁）。未完成的 RX 会把 DMA/软件缓冲留在堆上。
+3. **ES8311 `UpdateDeviceState` 只 close 不 delete**：Music 开麦（IN_OUT `esp_codec_dev_new`）再关麦后句柄泄漏；15s 省电门还会反复 new/close（Music 不走 `ReadAudioData`，`last_input_time_` 不刷新）。
+
+**修复**
+
+- Music `OnLeave`：等 in-flight capture → `EnableInput(false)` → 释放 `mic_buf_` → **DestroyPanel**；打 heap / largest
+- `NotifyInputActivity()` 防止省电门中途关 RX
+- ES8311：`Read`/`Write` 与 `EnableInput` 同锁；close 后 `esp_codec_dev_delete`
+- Radio：`OnEnter` / Capture 打 free+largest；`open`/`process` 失败打 `MEM_LACK`（`ESP_AUDIO_ERR_MEM_LACK=-2`）并立刻放弃，不再空转 connecting
+
+串口对照：`OnLeave Music after mic release` → `after panel destroy` → `codec device closed+deleted` → Radio `OnEnter ... heap= ... largest=` → `mp3 decoder open ok` → `pcm chunks=`。
+
 ## 遗留项
 
 - 稳定态仅剩 **15-20KB** 内部 SRAM，余量不宽裕。

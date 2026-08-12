@@ -89,6 +89,35 @@ size_t InternalHeapLargest() {
     return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
 }
 
+const char* AudioErrName(esp_audio_err_t err) {
+    switch (err) {
+        case ESP_AUDIO_ERR_OK:
+            return "OK";
+        case ESP_AUDIO_ERR_CONTINUE:
+            return "CONTINUE";
+        case ESP_AUDIO_ERR_FAIL:
+            return "FAIL";
+        case ESP_AUDIO_ERR_MEM_LACK:
+            return "MEM_LACK";
+        case ESP_AUDIO_ERR_DATA_LACK:
+            return "DATA_LACK";
+        case ESP_AUDIO_ERR_HEADER_PARSE:
+            return "HEADER_PARSE";
+        case ESP_AUDIO_ERR_INVALID_PARAMETER:
+            return "INVALID_PARAMETER";
+        case ESP_AUDIO_ERR_ALREADY_EXIST:
+            return "ALREADY_EXIST";
+        case ESP_AUDIO_ERR_NOT_SUPPORT:
+            return "NOT_SUPPORT";
+        case ESP_AUDIO_ERR_BUFF_NOT_ENOUGH:
+            return "BUFF_NOT_ENOUGH";
+        case ESP_AUDIO_ERR_NOT_FOUND:
+            return "NOT_FOUND";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 constexpr int kToneMs = 350;
 constexpr int kToneHz = 440;
 
@@ -331,9 +360,25 @@ int DecodeBuffered(StreamCtx* ctx, uint8_t* buf, int fill) {
             if (ret != ESP_AUDIO_ERR_OK) {
                 had_error = true;
                 ++ctx->frames_bad;
+                if (ret == ESP_AUDIO_ERR_MEM_LACK) {
+                    ESP_LOGE(TAG,
+                             "decode MEM_LACK ret=%d heap=%u largest=%u pcm_chunks=%u bad=%u",
+                             (int)ret, (unsigned)InternalHeapFree(),
+                             (unsigned)InternalHeapLargest(), (unsigned)ctx->pcm_chunks,
+                             (unsigned)ctx->frames_bad);
+                    if (ctx->pcm_chunks == 0) {
+                        ctx->format_rejected = true;
+                        if (ctx->page != nullptr) {
+                            ctx->page->SetStatusHint("mp3 mem lack");
+                        }
+                    }
+                    break;
+                }
                 if ((ctx->frames_bad % 200) == 1) {
-                    ESP_LOGW(TAG, "decode ret=%d (bad=%u ok=%u)", (int)ret,
-                             (unsigned)ctx->frames_bad, (unsigned)ctx->frames_ok);
+                    ESP_LOGW(TAG, "decode ret=%d (%s) (bad=%u ok=%u heap=%u largest=%u)",
+                             (int)ret, AudioErrName(ret), (unsigned)ctx->frames_bad,
+                             (unsigned)ctx->frames_ok, (unsigned)InternalHeapFree(),
+                             (unsigned)InternalHeapLargest());
                 }
                 // Only bail out if the decoder has never produced a single sample.
                 // A stream start carries ID3 tags and a partial frame, so early
@@ -407,8 +452,8 @@ bool OpenDecoder(StreamCtx* ctx) {
     const esp_audio_err_t ret = esp_audio_simple_dec_open(&cfg, &ctx->dec);
     const size_t after = InternalHeapFree();
     if (ret != ESP_AUDIO_ERR_OK) {
-        ESP_LOGE(TAG, "mp3 decoder open failed ret=%d (heap free=%u largest=%u)", (int)ret,
-                 (unsigned)before, (unsigned)before_largest);
+        ESP_LOGE(TAG, "mp3 decoder open failed ret=%d (%s) heap free=%u largest=%u", (int)ret,
+                 AudioErrName(ret), (unsigned)before, (unsigned)before_largest);
         ctx->dec = nullptr;
         return false;
     }
@@ -809,9 +854,10 @@ void RadioPage::CaptureAudioExclusive() {
             codec->EnableOutput(true);
         }
         codec->SetOutputVolume(kDefaultVolume);
-        ESP_LOGI(TAG, "codec vol=%d out=%d in=%d rate=%d", codec->output_volume(),
+        ESP_LOGI(TAG, "codec vol=%d out=%d in=%d rate=%d heap=%u largest=%u", codec->output_volume(),
                  codec->output_enabled() ? 1 : 0, codec->input_enabled() ? 1 : 0,
-                 codec->output_sample_rate());
+                 codec->output_sample_rate(), (unsigned)InternalHeapFree(),
+                 (unsigned)InternalHeapLargest());
     }
 }
 
