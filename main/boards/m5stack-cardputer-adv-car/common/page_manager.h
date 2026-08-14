@@ -3,6 +3,7 @@
 #include "car_page.h"
 #include "clock_page.h"
 #include "cursor_page.h"
+#include "dino_page.h"
 #include "emqx_mqtt_client.h"
 #include "launcher_page.h"
 #include "matrix_page.h"
@@ -10,6 +11,7 @@
 #include "page.h"
 #include "page_id.h"
 #include "radio_page.h"
+#include "snake_page.h"
 #include "spider_page.h"
 #include "tca8418_keyboard.h"
 
@@ -49,6 +51,8 @@ private:
     MatrixPage matrix_page_;
     CursorPage cursor_page_;  // Music (mic visualizer)
     RadioPage radio_page_;
+    SnakePage snake_page_;
+    DinoPage dino_page_;
 
     Page* GetPage(PageId id);
     void RecoverToChat(const char* reason);

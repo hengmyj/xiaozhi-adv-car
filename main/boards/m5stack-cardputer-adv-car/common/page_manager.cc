@@ -36,7 +36,8 @@ bool ShouldReleaseResidentUi(PageId from, PageId to) {
         return false;
     }
     return from == PageId::Car || from == PageId::Spider || from == PageId::MjAc ||
-           from == PageId::Clock || from == PageId::Matrix;
+           from == PageId::Clock || from == PageId::Matrix || from == PageId::Snake ||
+           from == PageId::Dino;
 }
 
 }  // namespace
@@ -92,6 +93,10 @@ Page* PageManager::GetPage(PageId id) {
             return &cursor_page_;
         case PageId::Radio:
             return &radio_page_;
+        case PageId::Snake:
+            return &snake_page_;
+        case PageId::Dino:
+            return &dino_page_;
         default:
             return nullptr;
     }
@@ -101,6 +106,7 @@ void PageManager::ReleaseOtherExclusiveUi(PageId keep) {
     static const PageId kExclusive[] = {
         PageId::Car,      PageId::Spider, PageId::MjAc,  PageId::Launcher,
         PageId::Clock,    PageId::Matrix, PageId::Music, PageId::Radio,
+        PageId::Snake,    PageId::Dino,
     };
     const size_t before = FreeHeap();
     const size_t before_largest = LargestHeap();
@@ -357,6 +363,10 @@ void PageManager::Tick() {
         radio_page_.Tick(display_);
     } else if (current_ == PageId::Launcher) {
         launcher_page_.Tick(display_);
+    } else if (current_ == PageId::Snake) {
+        snake_page_.Tick(display_);
+    } else if (current_ == PageId::Dino) {
+        dino_page_.Tick(display_);
     }
 }
 
@@ -382,6 +392,12 @@ bool PageManager::HandleVehicleKey(const KeyEvent& event) {
     }
     if (current_ == PageId::Radio) {
         return radio_page_.HandleKey(event);
+    }
+    if (current_ == PageId::Snake) {
+        return snake_page_.HandleKey(event);
+    }
+    if (current_ == PageId::Dino) {
+        return dino_page_.HandleKey(event);
     }
     return false;
 }

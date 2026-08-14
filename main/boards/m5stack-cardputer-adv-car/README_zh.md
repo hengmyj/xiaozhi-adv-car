@@ -23,6 +23,7 @@ m5stack-cardputer-adv-car/
     matrix/                      # Rain 字幕下落（淡出拖尾）
     cursor/                      # Music 拾音柱状图（文件名仍为 cursor）
     radio/                       # 央广 CNR1 WiFi 直播
+    snake/                       # 贪吃蛇（16x9 全屏格子，无 canvas）
   ir/                            # 板载红外（GPIO44），与 pages/icebox 配合
 ```
 
@@ -49,6 +50,8 @@ m5stack-cardputer-adv-car/
   | **5** | Rain | Matrix 字幕下落（淡出拖尾） |
   | **6** | Music | 拾音器柱状图（ES8311 mic；原 Cursor） |
   | **7** | Radio | 央广 CNR1 中国之声（HLS/TS AAC → ES8311） |
+  | **8** | Snake | 贪吃蛇（`;`上 `.`下 `,`左 `/`右 或 WASD；Enter 开始/重开；P 暂停） |
+  | **9** | Dino | 小恐龙跑酷（空格/Enter/W/↑ 跳跃；P 暂停；随分数加速） |
 - 车控页：**;** 前进、**.** 停止、**,** 左转、**/** 右转（无需 Fn）
 - IceBox 空调页：针对 **三菱电机 ZFJ 系列 MSZ-ZFJ12VA（KFR-36GW/BpU / ZFJ12）**
   - **P** 电源、**M** 模式、**F** 风速、**;**/**.** 温度 — 每次按键立即改 UI 并发红外（无需 Enter）

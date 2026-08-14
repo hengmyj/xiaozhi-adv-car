@@ -22,7 +22,7 @@ Cardputer ADV 小智 fork + 多页启动器。
 - 音频内存（无 PSRAM）：进 Radio 仅剩 27KB → MP3 解码器 `MEM_LACK`；`AudioService` 常驻 Opus 占 43KB，`ReleaseAudioModels()` 后回到 70KB。本板 `CONFIG_WAKE_WORD_DISABLED=y` 无 AFE，释放唤醒词模型无效
 - `esp_audio_simple_dec_open()` 惰性：只占 148B 即返回成功，真解码器等第一帧才分配——「open 成功」≠ 能解码
 - Radio 流任务必须 **core 0 / prio 3**（`taskLVGL` 在 core1/prio1，抢了就触发 `task_wdt: CPU 1: taskLVGL`）
-- `cyberwisk/M5Cardputer_WebRadio` 不可照搬：原版 Cardputer 有 8MB PSRAM，其 HTTPS+128kbps 在 ADV 上跑不起来
+- `cyberwisk/M5Cardputer_WebRadio` 不可照搬：GitHub 原版针对有 8MB PSRAM 的 Cardputer；M5Burner 虽有 ADV 专用 WebRadio（Arduino/`ESP32-audioI2S` 独占栈）能播，但不能迁入小智 LVGL 多页（无 PSRAM 下 HTTPS+128kbps 仍不够）
 - 拿不到解码器格式信息时宁可静音；把未解码 MP3 字节当 PCM 播就是滋啦噪音来源
 - 勿设 `CONFIG_ESP_CONSOLE_NONE=y`：panic 无处输出，重启循环看不到 backtrace
 - 串口出现 `Device not configured` / reconnect 等待：USB CDC 常已断开，需拔插并确认 `/dev/cu.usbmodem*`；macOS Cmd+C 不会停 idf_monitor

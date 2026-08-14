@@ -21,12 +21,12 @@ namespace {
 constexpr lv_coord_t kScreenW = 240;
 constexpr lv_coord_t kScreenH = 135;
 constexpr lv_coord_t kStatusH = 24;
-constexpr lv_coord_t kBtnW = 112;
-constexpr lv_coord_t kBtnH = 24;
+constexpr lv_coord_t kBtnW = 72;
+constexpr lv_coord_t kBtnH = 28;
 constexpr lv_coord_t kGapX = 6;
-constexpr lv_coord_t kGapY = 2;
+constexpr lv_coord_t kGapY = 4;
 constexpr lv_coord_t kGridX = 5;
-constexpr lv_coord_t kGridY = 26;
+constexpr lv_coord_t kGridY = 28;
 
 void StripStyles(lv_obj_t* obj) {
     lv_obj_remove_style_all(obj);
@@ -38,8 +38,8 @@ void StripStyles(lv_obj_t* obj) {
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICK_FOCUSABLE);
 }
 
-// Hollow dotted capital M ù sized to sit on the same visual baseline as "YJ"
-// (BUILTIN_TEXT_FONT ~20px). Pitch 2 ? 14ù18px glyph.
+// Hollow dotted capital M ? sized to sit on the same visual baseline as "YJ"
+// (BUILTIN_TEXT_FONT ~20px). Pitch 2 ? 14?18px glyph.
 constexpr int kMCols = 7;
 constexpr int kMRows = 9;
 constexpr const char* kMDots[kMRows] = {
@@ -114,10 +114,10 @@ lv_obj_t* LauncherPage::MakeAppButton(lv_obj_t* parent, const char* badge, const
     lv_obj_t* badge_box = lv_obj_create(btn);
     StripStyles(badge_box);
     lv_obj_set_size(badge_box, 16, 16);
-    lv_obj_set_pos(badge_box, 5, (h - 16) / 2);
     lv_obj_set_style_bg_color(badge_box, lv_color_hex(color), 0);
     lv_obj_set_style_bg_opa(badge_box, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(badge_box, 3, 0);
+    lv_obj_align(badge_box, LV_ALIGN_LEFT_MID, 4, 0);
 
     lv_obj_t* badge_lbl = lv_label_create(badge_box);
     lv_label_set_text(badge_lbl, badge);
@@ -127,9 +127,10 @@ lv_obj_t* LauncherPage::MakeAppButton(lv_obj_t* parent, const char* badge, const
 
     lv_obj_t* title_lbl = lv_label_create(btn);
     lv_label_set_text(title_lbl, title);
-    lv_obj_set_style_text_font(title_lbl, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(title_lbl, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(title_lbl, LV_ALIGN_LEFT_MID, 26, 0);
+    lv_obj_set_style_text_letter_space(title_lbl, 0, 0);
+    lv_obj_align_to(title_lbl, badge_box, LV_ALIGN_OUT_RIGHT_MID, 3, 0);
 
     return btn;
 }
@@ -190,17 +191,19 @@ void LauncherPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
 
     // ASCII titles avoid garbled CJK when glyph subset is incomplete.
     const int col2 = kGridX + kBtnW + kGapX;
+    const int col3 = col2 + kBtnW + kGapX;
     const int row2 = kGridY + kBtnH + kGapY;
     const int row3 = row2 + kBtnH + kGapY;
-    const int row4 = row3 + kBtnH + kGapY;
 
     btns_[0] = MakeAppButton(panel_, "1", "Car", 0xF0C040, kGridX, kGridY, kBtnW, kBtnH);
-    btns_[1] = MakeAppButton(panel_, "2", "SpiderBot", 0xA855F7, col2, kGridY, kBtnW, kBtnH);
-    btns_[2] = MakeAppButton(panel_, "3", "IceBox", 0x3B82F6, kGridX, row2, kBtnW, kBtnH);
-    btns_[3] = MakeAppButton(panel_, "4", "Clock", 0x22C55E, col2, row2, kBtnW, kBtnH);
-    btns_[4] = MakeAppButton(panel_, "5", "Rain", 0x10B981, kGridX, row3, kBtnW, kBtnH);
-    btns_[5] = MakeAppButton(panel_, "6", "Music", 0x06B6D4, col2, row3, kBtnW, kBtnH);
-    btns_[6] = MakeAppButton(panel_, "7", "Radio", 0x00FF66, kGridX, row4, kBtnW, kBtnH);
+    btns_[1] = MakeAppButton(panel_, "2", "Spider", 0xA855F7, col2, kGridY, kBtnW, kBtnH);
+    btns_[2] = MakeAppButton(panel_, "3", "IceBox", 0x3B82F6, col3, kGridY, kBtnW, kBtnH);
+    btns_[3] = MakeAppButton(panel_, "4", "Clock", 0x22C55E, kGridX, row2, kBtnW, kBtnH);
+    btns_[4] = MakeAppButton(panel_, "5", "Rain", 0x10B981, col2, row2, kBtnW, kBtnH);
+    btns_[5] = MakeAppButton(panel_, "6", "Music", 0x06B6D4, col3, row2, kBtnW, kBtnH);
+    btns_[6] = MakeAppButton(panel_, "7", "Radio", 0x00FF66, kGridX, row3, kBtnW, kBtnH);
+    btns_[7] = MakeAppButton(panel_, "8", "Snake", 0xEF4444, col2, row3, kBtnW, kBtnH);
+    btns_[8] = MakeAppButton(panel_, "9", "Dino", 0xFF9900, col3, row3, kBtnW, kBtnH);
 }
 
 void LauncherPage::RefreshTime(CardputerAdvCarLcdDisplay* display) {
@@ -295,6 +298,12 @@ bool LauncherPage::HandleKey(const KeyEvent& event) {
         matched = true;
     } else if (event.key_code == KC_7 || ch == '7') {
         target = PageId::Radio;
+        matched = true;
+    } else if (event.key_code == KC_8 || ch == '8') {
+        target = PageId::Snake;
+        matched = true;
+    } else if (event.key_code == KC_9 || ch == '9') {
+        target = PageId::Dino;
         matched = true;
     }
 
