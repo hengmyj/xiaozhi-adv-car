@@ -16,6 +16,9 @@
 #include <vector>
 
 #include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
@@ -252,8 +255,8 @@ void DinoPage::StepFrame() {
         if (AabbHit(dino_ax, dino_ay, dino_aw, dino_ah, tree_x_[i], ty, kTreeW - 2,
                     kTreeTotalH)) {
             phase_ = Phase::Dead;
-            Beep(90, 500);   // "bweep" fall
-            Beep(200, 150);  // "boo" low thud
+            Beep(120, 440, 4000);  // soft "bweep"
+            Beep(240, 196, 4000);  // low gentle "boo"
             return;
         }
     }
@@ -265,7 +268,7 @@ void DinoPage::StepFrame() {
     }
 }
 
-void DinoPage::Beep(int ms, int hz) {
+void DinoPage::Beep(int ms, int hz, int amp) {
     // Serialize all speaker writes (jump sfx, death sfx, BGM task).
     static SemaphoreHandle_t mux = nullptr;
     if (mux == nullptr) {
@@ -297,9 +300,13 @@ void DinoPage::Beep(int ms, int hz) {
     }
     double phase = 0.0;
     const double step = 2.0 * M_PI * hz / rate;
+    const double total = static_cast<double>(blocks * block);
     for (int b = 0; b < blocks; ++b) {
         for (int i = 0; i < block; ++i) {
-            buf[static_cast<size_t>(i)] = static_cast<int16_t>(6000.0 * std::sin(phase));
+            // Soft exponential decay: pluck-like, no harsh square sustain.
+            const double t = static_cast<double>(b * block + i) / total;
+            const double env = std::exp(-2.4 * t);
+            buf[static_cast<size_t>(i)] = static_cast<int16_t>(amp * env * std::sin(phase));
             phase += step;
         }
         codec->OutputData(buf);
@@ -310,18 +317,19 @@ void DinoPage::Beep(int ms, int hz) {
 
 void DinoPage::MusicTask(void* arg) {
     auto* page = static_cast<DinoPage*>(arg);
-    // Cheerful C-major arpeggio loop: C4 E4 G4 C5 E5 C5 G4 E4.
+    // Gentle C-major arpeggio, slow and laid-back.
     static const int kMelody[] = {262, 330, 392, 523, 659, 523, 392, 330};
     const int n = static_cast<int>(sizeof(kMelody) / sizeof(kMelody[0]));
     int idx = 0;
     while (true) {
-        if (!page->active_ || page->phase_ != Phase::Running) {
-            vTaskDelay(pdMS_TO_TICKS(50));  // idle in Ready/Paused/Dead
+        // Play in Ready and Running; hold during Paused/Dead.
+        if (!page->active_ || (page->phase_ != Phase::Ready && page->phase_ != Phase::Running)) {
+            vTaskDelay(pdMS_TO_TICKS(50));  // idle in Paused/Dead
             continue;
         }
-        page->Beep(100, kMelody[idx]);
+        page->Beep(200, kMelody[idx], 3000);
         idx = (idx + 1) % n;
-        vTaskDelay(pdMS_TO_TICKS(40));  // breath between notes
+        vTaskDelay(pdMS_TO_TICKS(120));  // long breath between notes
     }
 }
 
@@ -519,7 +527,7 @@ bool DinoPage::HandleKey(const KeyEvent& event) {
             jumping_ = true;
             dino_vy_ = -6.6f;  // apex ~48px, plenty over the 28px trees
             dino_y_ = -0.1f;
-            Beep(60, 880);  // quick chirp on jump
+            Beep(80, 523, 4000);  // soft chirp on jump (C5)
         }
         if (display_ != nullptr) {
             DisplayLockGuard lock(display_);

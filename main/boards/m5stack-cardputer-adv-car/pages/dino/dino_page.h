@@ -37,7 +37,7 @@ private:
     void StepFrame();
     void DrawScene();
     void UpdateHud();
-    void Beep(int ms, int hz);
+    void Beep(int ms, int hz, int amp = 6000);
     void StartMusic();
     void StopMusic();
     static void MusicTask(void* arg);
