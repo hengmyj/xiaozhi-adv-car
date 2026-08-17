@@ -16,6 +16,7 @@ public:
 
     void OnEnter(CardputerAdvCarLcdDisplay* display) override;
     void OnLeave(CardputerAdvCarLcdDisplay* display) override;
+    void ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) override;
     void Tick(CardputerAdvCarLcdDisplay* display);
     bool HandleKey(const KeyEvent& event);
     lv_obj_t* GetRootPanel() const override { return panel_; }
@@ -35,6 +36,6 @@ private:
     lv_obj_t* panel_ = nullptr;
     lv_obj_t* time_label_ = nullptr;
     int last_sec_ = -1;
-    static constexpr int kAppCount = 7;
+    static constexpr int kAppCount = 9;
     lv_obj_t* btns_[kAppCount] = {};
 };

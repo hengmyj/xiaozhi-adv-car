@@ -4,6 +4,7 @@
 
 #include <lvgl.h>
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -13,6 +14,7 @@ class CursorPage : public Page {
 public:
     void OnEnter(CardputerAdvCarLcdDisplay* display) override;
     void OnLeave(CardputerAdvCarLcdDisplay* display) override;
+    void ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) override;
     void Tick(CardputerAdvCarLcdDisplay* display);
     lv_obj_t* GetRootPanel() const override { return panel_; }
 
@@ -22,6 +24,7 @@ private:
     void UpdateBars(CardputerAdvCarLcdDisplay* display);
     void CaptureMic();
     void ReleaseMicExclusive();
+    void FreeMicBuffer();
 
     static constexpr int kBarCount = 24;
     static constexpr int kMicSamples = 512;
@@ -31,6 +34,7 @@ private:
     bool mic_exclusive_ = false;
     bool saved_wake_word_ = false;
     bool saved_voice_proc_ = false;
+    std::atomic<bool> capturing_{false};
 
     lv_obj_t* panel_ = nullptr;
     lv_obj_t* bars_[kBarCount] = {};

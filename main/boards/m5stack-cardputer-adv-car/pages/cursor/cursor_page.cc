@@ -8,7 +8,10 @@
 
 #include <font_awesome.h>
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <cmath>
 #include <cstdio>
@@ -53,6 +56,10 @@ void CursorPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
         bars_[i] = nullptr;
         levels_[i] = 0;
     }
+}
+
+void CursorPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    DestroyPanel(display);
 }
 
 void CursorPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
@@ -133,24 +140,58 @@ void CursorPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     (void)kFooterH;
 }
 
+void CursorPage::FreeMicBuffer() {
+    if (mic_buf_.empty() && mic_buf_.capacity() == 0) {
+        return;
+    }
+    const size_t bytes = mic_buf_.capacity() * sizeof(int16_t);
+    std::vector<int16_t>().swap(mic_buf_);
+    ESP_LOGI(TAG, "mic_buf freed %uB", (unsigned)bytes);
+}
+
 void CursorPage::ReleaseMicExclusive() {
     if (!mic_exclusive_) {
+        auto* codec = Board::GetInstance().GetAudioCodec();
+        if (codec != nullptr && codec->input_enabled()) {
+            codec->EnableInput(false);
+        }
         return;
     }
     mic_exclusive_ = false;
     saved_wake_word_ = false;
     saved_voice_proc_ = false;
-    // Re-sync Application wake-word / voice for current device state (do not
-    // blindly restore saved flags — that desyncs Idle vs Listening).
-    Application::GetInstance().RestoreAudioRouting();
-    ESP_LOGI(TAG, "mic exclusive released + RestoreAudioRouting");
+    // Drop the mic path only. Do NOT RestoreAudioRouting here: that rebuilds Opus
+    // and re-arms wake-word, which fights Radio re-enter (heap thrash + duplex RX
+    // left on). Chat rebuilds after ShowPage(Chat) via ScheduleChatAudioRestore.
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec != nullptr) {
+        codec->EnableInput(false);
+    }
+    ESP_LOGI(TAG, "mic exclusive released (input off, routing deferred to Chat) heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void CursorPage::CaptureMic() {
-    auto* codec = Board::GetInstance().GetAudioCodec();
-    if (codec == nullptr) {
+    if (!active_ || !mic_exclusive_) {
         return;
     }
+    capturing_.store(true);
+    if (!active_ || !mic_exclusive_) {
+        capturing_.store(false);
+        return;
+    }
+
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec == nullptr) {
+        capturing_.store(false);
+        return;
+    }
+    // Keep the power-save timer from closing RX while this page owns the mic.
+    // Music Tick does not go through AudioService::ReadAudioData, so without
+    // this the 15s idle gate EnableInput(false)s and the next tick re-opens
+    // the duplex device — fragmenting no-PSRAM heap before Radio.
+    Application::GetInstance().GetAudioService().NotifyInputActivity();
     if (!codec->input_enabled()) {
         codec->EnableInput(true);
     }
@@ -159,6 +200,7 @@ void CursorPage::CaptureMic() {
         mic_buf_.assign(kMicSamples, 0);
     }
     if (!codec->InputData(mic_buf_)) {
+        capturing_.store(false);
         return;
     }
 
@@ -166,6 +208,7 @@ void CursorPage::CaptureMic() {
     const int n = static_cast<int>(mic_buf_.size());
     const int seg = n / kBarCount;
     if (seg <= 0) {
+        capturing_.store(false);
         return;
     }
 
@@ -214,6 +257,7 @@ void CursorPage::CaptureMic() {
             levels_[b] = levels_[b] * 0.75f + target * 0.25f;
         }
     }
+    capturing_.store(false);
 }
 
 void CursorPage::UpdateBars(CardputerAdvCarLcdDisplay* display) {
@@ -255,7 +299,10 @@ void CursorPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     display_ = display;
     active_ = true;
     peak_ = 200.0f;
-    ESP_LOGI(TAG, "OnEnter Music mic visualizer reuse=%d", panel_ != nullptr ? 1 : 0);
+    ESP_LOGI(TAG, "OnEnter Music mic visualizer reuse=%d heap=%u largest=%u",
+             panel_ != nullptr ? 1 : 0,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     // Always (re)take exclusive mic; OnLeave must restore even on quick switch.
     ReleaseMicExclusive();
@@ -265,6 +312,7 @@ void CursorPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     audio.EnableWakeWordDetection(false);
     audio.EnableVoiceProcessing(false);
     mic_exclusive_ = true;
+    audio.NotifyInputActivity();
 
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
@@ -275,6 +323,7 @@ void CursorPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     if (panel_ == nullptr) {
         ESP_LOGE(TAG, "BuildPanel failed — releasing mic");
         ReleaseMicExclusive();
+        FreeMicBuffer();
         active_ = false;
         return;
     }
@@ -287,14 +336,29 @@ void CursorPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
 }
 
 void CursorPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
+    // Stop new ticks first. CaptureMic runs on the shared esp_timer task
+    // (blocking I2S read); wait it out before closing RX so we do not close
+    // esp_codec_dev under an in-flight read (leaks DMA / fragments heap).
     active_ = false;
-    ReleaseMicExclusive();
-
-    if (display == nullptr || panel_ == nullptr) {
-        return;
+    for (int i = 0; i < 40 && capturing_.load(); ++i) {
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
-    DisplayLockGuard lock(display);
-    lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
+    if (capturing_.load()) {
+        ESP_LOGW(TAG, "OnLeave: mic capture still in flight after wait");
+    }
+    ReleaseMicExclusive();
+    FreeMicBuffer();
+    ESP_LOGI(TAG, "OnLeave Music after mic release heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    // Drop the visualizer (24 bars + grid). Hidden panels stay resident and
+    // Music→Launcher→Radio stacks three exclusive UIs on no-PSRAM; Radio's
+    // MP3 decoder needs the contiguous block more than a cached Music page.
+    DestroyPanel(display);
+    ESP_LOGI(TAG, "OnLeave Music after panel destroy heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void CursorPage::Tick(CardputerAdvCarLcdDisplay* display) {

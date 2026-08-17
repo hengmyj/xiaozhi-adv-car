@@ -2,6 +2,69 @@
 
 本目录为 **xiaozhi-ADV-car** 专用板型，OTA 板名：`m5stack-cardputer-adv-car`。
 
+**板级文档**（架构、每页操作、加图/内存坑）：[docs/README.md](docs/README.md)
+
+## 架构规划
+
+开机进 **Chat**。板入口挂上键盘 / 屏 / 音频 / 红外后，交给 `PageManager` 管页面：聊天 UI 只隐藏不销毁；其余独占页按需建、离页拆，给无 PSRAM 腾堆。分层细节、切页内存见 [docs/architecture.md](docs/architecture.md)。
+
+```mermaid
+flowchart TB
+  subgraph hw [硬件]
+    KB[TCA8418 键盘]
+    LCD[ST7789 240x135]
+    Codec[ES8311]
+    IR[红外 GPIO44]
+  end
+
+  Board["板入口 m5stack_cardputer_adv_car.cc"]
+  Board --> KB
+  Board --> LCD
+  Board --> Codec
+  Board --> IR
+  Board --> MQTT["EmqxCarMqtt broker-cn.emqx.io"]
+  Board --> PM[PageManager]
+
+  KB -->|Fn+1 / Fn+2| PM
+  KB -->|页内键| PM
+
+  PM --> Chat[Chat 小智主页]
+  PM --> Launcher[Launcher 启动器]
+  PM --> Apps[9 个分页面]
+  Launcher -->|数字 1-9| Apps
+```
+
+切页（任意页都有效；分页面只能从启动器进，没有 Fn+3 直切）：
+
+```mermaid
+flowchart LR
+  Chat[Chat 小智]
+  Launcher[启动器]
+  Pages[9 个分页面]
+
+  Chat -->|Fn+2| Launcher
+  Launcher -->|Fn+1| Chat
+  Pages -->|Fn+1| Chat
+  Pages -->|Fn+2| Launcher
+  Launcher -->|1-9| Pages
+```
+
+| 入口 | 页面 | 做什么 |
+|------|------|--------|
+| 开机 / **Fn+1** | Chat | 小智语音聊天 |
+| **Fn+2** | 启动器 | 3×3 菜单，数字 1–9 进分页面 |
+| 启动器 **1** | Car | MQTT 麦轮 |
+| **2** | Spider | MQTT 蜘蛛 |
+| **3** | IceBox | 红外空调 |
+| **4** | Clock | 像素时钟 |
+| **5** | Rain | Matrix 字幕 |
+| **6** | Music | 麦拾音柱 |
+| **7** | Radio | 网络电台 |
+| **8** | Snake | 贪吃蛇 |
+| **9** | Dino | 小恐龙跑酷 |
+
+每页画面、按键、进出页行为：[docs/pages.md](docs/pages.md)。加图须编译期 RGB565，禁止运行时解 PNG：[docs/images.md](docs/images.md)。
+
 ## 目录结构
 
 ```
@@ -23,7 +86,10 @@ m5stack-cardputer-adv-car/
     matrix/                      # Rain 字幕下落（淡出拖尾）
     cursor/                      # Music 拾音柱状图（文件名仍为 cursor）
     radio/                       # 央广 CNR1 WiFi 直播
+    snake/                       # 贪吃蛇（16x9 全屏格子，无 canvas）
+    dino/                        # 小恐龙跑酷
   ir/                            # 板载红外（GPIO44），与 pages/icebox 配合
+  docs/                          # 架构 / 页面操作 / 图片内存
 ```
 
 ## 与官方 ADV 的区别
@@ -49,6 +115,24 @@ m5stack-cardputer-adv-car/
   | **5** | Rain | Matrix 字幕下落（淡出拖尾） |
   | **6** | Music | 拾音器柱状图（ES8311 mic；原 Cursor） |
   | **7** | Radio | 央广 CNR1 中国之声（HLS/TS AAC → ES8311） |
+  | **8** | Snake | 贪吃蛇（`;`上 `.`下 `,`左 `/`右 或 WASD；Enter 开始/重开；P 暂停） |
+  | **9** | Dino | 小恐龙跑酷（空格/Enter/W/↑ 跳跃；P 暂停；随分数加速） |
+
+  Dino 页画面示意：
+
+  ```
+  DINO 123      00:45        SPD 5.6
+  (分数·左)   (计时·顶中)  (速度·右)
+                        ✧ (☀) ✧      ← 太阳+光芒，缓慢漂浮
+                     ⌣⌣⌣             ← 海鸥简笔画，5~15s 飞过一只，1.6x 树速
+            ▲
+           / \        ← 杉树（绿三角+棕树干，随分数加速滚来）
+      ═══════════════════
+        🦖 (腿蹬地)      ← 空格/↑ 跳跃
+  ```
+
+  - 左上：分数；顶中：计时 MM:SS（开跑开始计，暂停/死亡冻结）；右上：SPD 速度
+  - 音效：跳跃"嘀"、撞树"哔—呜"、C 大调琶音 BGM（Running 时循环）
 - 车控页：**;** 前进、**.** 停止、**,** 左转、**/** 右转（无需 Fn）
 - IceBox 空调页：针对 **三菱电机 ZFJ 系列 MSZ-ZFJ12VA（KFR-36GW/BpU / ZFJ12）**
   - **P** 电源、**M** 模式、**F** 风速、**;**/**.** 温度 — 每次按键立即改 UI 并发红外（无需 Enter）

@@ -1,5 +1,7 @@
 #include "es8311_audio_codec.h"
 
+#include <driver/i2s_common.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 
 #define TAG "Es8311AudioCodec"
@@ -59,7 +61,10 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
 }
 
 Es8311AudioCodec::~Es8311AudioCodec() {
-    esp_codec_dev_delete(dev_);
+    if (dev_ != nullptr) {
+        esp_codec_dev_delete(dev_);
+        dev_ = nullptr;
+    }
 
     audio_codec_delete_codec_if(codec_if_);
     audio_codec_delete_ctrl_if(ctrl_if_);
@@ -87,9 +92,20 @@ void Es8311AudioCodec::UpdateDeviceState() {
         ESP_ERROR_CHECK(esp_codec_dev_open(dev_, &fs));
         ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(dev_, input_gain_));
         ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(dev_, output_volume_));
+        ESP_LOGI(TAG, "codec device open heap=%u largest=%u in=%d out=%d",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 input_enabled_ ? 1 : 0, output_enabled_ ? 1 : 0);
     } else if (!input_enabled_ && !output_enabled_ && dev_ != nullptr) {
+        // close + delete: the old path only closed then nulled the pointer, so
+        // every Music/power-gate cycle leaked the handle (and any RX software
+        // buffers still attached). Next open then called esp_codec_dev_new again.
         esp_codec_dev_close(dev_);
+        esp_codec_dev_delete(dev_);
         dev_ = nullptr;
+        ESP_LOGI(TAG, "codec device closed+deleted heap=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
     if (pa_pin_ != GPIO_NUM_NC) {
         int level = output_enabled_ ? 1 : 0;
@@ -163,6 +179,37 @@ void Es8311AudioCodec::SetOutputVolume(int volume) {
     AudioCodec::SetOutputVolume(volume);
 }
 
+void Es8311AudioCodec::RecycleDevice() {
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    ESP_LOGI(TAG, "RecycleDevice begin dev=%p in=%d out=%d heap=%u largest=%u",
+             dev_, input_enabled_ ? 1 : 0, output_enabled_ ? 1 : 0,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (dev_ != nullptr) {
+        esp_codec_dev_close(dev_);
+        esp_codec_dev_delete(dev_);
+        dev_ = nullptr;
+    }
+    auto disable_ch = [](i2s_chan_handle_t handle, const char* name) {
+        if (handle == nullptr) {
+            return;
+        }
+        esp_err_t err = i2s_channel_disable(handle);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "RecycleDevice disable %s: %s", name, esp_err_to_name(err));
+        }
+    };
+    disable_ch(tx_handle_, "tx");
+    disable_ch(rx_handle_, "rx");
+    input_enabled_ = true;
+    output_enabled_ = true;
+    UpdateDeviceState();
+    ESP_LOGI(TAG, "RecycleDevice done dev=%p in=%d out=%d heap=%u largest=%u",
+             dev_, input_enabled_ ? 1 : 0, output_enabled_ ? 1 : 0,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
 void Es8311AudioCodec::EnableInput(bool enable) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
     if (codec_if_ == nullptr) {
@@ -188,14 +235,16 @@ void Es8311AudioCodec::EnableOutput(bool enable) {
 }
 
 int Es8311AudioCodec::Read(int16_t* dest, int samples) {
-    if (input_enabled_) {
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    if (input_enabled_ && dev_ != nullptr) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(dev_, (void*)dest, samples * sizeof(int16_t)));
     }
     return samples;
 }
 
 int Es8311AudioCodec::Write(const int16_t* data, int samples) {
-    if (output_enabled_) {
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    if (output_enabled_ && dev_ != nullptr) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(dev_, (void*)data, samples * sizeof(int16_t)));
     }
     return samples;

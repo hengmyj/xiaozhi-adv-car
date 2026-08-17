@@ -5,6 +5,7 @@
 
 #include <font_awesome.h>
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 
@@ -135,6 +136,8 @@ void MjAcPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ == nullptr || display == nullptr) {
         return;
     }
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t before_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     DisplayLockGuard lock(display);
     lv_obj_del(panel_);
     panel_ = nullptr;
@@ -149,12 +152,19 @@ void MjAcPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     for (int i = 0; i < 6; ++i) {
         btns_[i] = nullptr;
     }
+    ESP_LOGI(TAG, "DestroyPanel IceBox heap %u->%u largest %u->%u", (unsigned)before,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)before_largest,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void MjAcPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ != nullptr) {
         return;
     }
+
+    ESP_LOGI(TAG, "BuildPanel IceBox start heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     DisplayLockGuard lock(display);
     panel_ = lv_obj_create(display->GetScreen());
@@ -245,6 +255,9 @@ void MjAcPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     btns_[4] = MakeKeyButton(right, "M", "Mode", kGridX + step_x, kGridY + step_y, false);
     btns_[5] = MakeKeyButton(right, FONT_AWESOME_ARROW_DOWN, "Temp", kGridX + 2 * step_x,
                              kGridY + step_y, true);
+    ESP_LOGI(TAG, "BuildPanel IceBox done heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void MjAcPage::RefreshUi(CardputerAdvCarLcdDisplay* display) {
@@ -377,8 +390,10 @@ void MjAcPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
 
     display_ = display;
     active_ = true;
-    ESP_LOGI(TAG, "OnEnter MJ AC page protocol=%s reuse=%d", MitsubishiIrSender::ProtocolName(),
-             panel_ != nullptr ? 1 : 0);
+    ESP_LOGI(TAG, "OnEnter MJ AC page protocol=%s reuse=%d heap=%u largest=%u",
+             MitsubishiIrSender::ProtocolName(), panel_ != nullptr ? 1 : 0,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     ir_.Initialize();
 
     BuildPanel(display);
@@ -392,7 +407,7 @@ void MjAcPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
         lv_obj_clear_flag(panel_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(panel_);
     }
-    // HideChatUi takes its own display lock ó do not nest locks here.
+    // HideChatUi takes its own display lock ù do not nest locks here.
     display->HideChatUi();
 
     last_power_ = !state_.power;
@@ -403,19 +418,32 @@ void MjAcPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     last_flash_index_ = -2;
     ui_dirty_ = true;
     RefreshUi(display);
+    ESP_LOGI(TAG, "OnEnter IceBox done heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void MjAcPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
     active_ = false;
-    // Stop IR worker BEFORE any DisplayLock ó bit-bang must not starve LVGL
+    // Stop IR worker BEFORE any DisplayLock ù bit-bang must not starve LVGL
     // while ShowPage tries to enter Car/Spider/Launcher.
     ir_.Cancel();
     if (display == nullptr || panel_ == nullptr) {
+        ESP_LOGI(TAG, "OnLeave IceBox (no panel) heap=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return;
     }
 
     DisplayLockGuard lock(display);
     lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
+    ESP_LOGI(TAG, "OnLeave IceBox hidden heap=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+void MjAcPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    DestroyPanel(display);
 }
 
 void MjAcPage::Tick(CardputerAdvCarLcdDisplay* display) {

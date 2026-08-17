@@ -105,6 +105,14 @@ void SpiderPage::BuildSceneGraphic(lv_obj_t* parent) {
     }
 }
 
+void SpiderPage::ResetSceneWidgets() {
+    abdomen_ = nullptr;
+    head_ = nullptr;
+    for (int i = 0; i < kLegCount; ++i) {
+        legs_[i] = nullptr;
+    }
+}
+
 void SpiderPage::UpdateSceneGraphic(int running) {
     if (abdomen_ == nullptr) {
         return;

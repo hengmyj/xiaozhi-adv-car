@@ -20,7 +20,7 @@ Cardputer ADV（ESP32-S3FN8 + 8MB flash，**无 PSRAM**）上 Radio 页从「卡
 
 ## 修复：释放常驻 Opus（43KB）
 
-`AudioService` 的 Opus 编/解码器常驻占用 **43KB**，而 Radio 页直连 codec 播 PCM，根本用不到 Opus。进页时 `AudioService::ReleaseAudioModels()` 关掉这一对，离页 `RestoreAudioModels()` 重建。
+`AudioService` 的 Opus 编/解码器常驻占用 **43KB**，而 Radio 页直连 codec 播 PCM，根本用不到 Opus。进页时 `AudioService::ReleaseAudioModels()` 关掉这一对；**离页不重建**，等 Fn+1 回到 Chat 且页面完全显示后再 `ScheduleChatAudioRestore`。
 
 | 阶段 | 内部 SRAM 可用 |
 |------|----------------|
@@ -34,7 +34,7 @@ Cardputer ADV（ESP32-S3FN8 + 8MB flash，**无 PSRAM**）上 Radio 页从「卡
 released audio models: internal heap 27340 -> 70432
 ```
 
-低于 `kMinHeapToStream`（12KB）直接拒绝开流并提示 `low memory`，不再靠崩溃暴露问题。
+总空闲低于 `kMinHeapToStream`（12KB）才拒绝开流并提示 `low memory`。`largest < 20KB` **只告警仍尝试**，以 decoder 真失败（`MEM_LACK`）为准，避免切几下页面后碎片化误杀。
 
 ## 关键坑
 
@@ -90,7 +90,8 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 | 日志 | 含义 / 处理 |
 |------|-------------|
 | `ESP_MP3_DEC: There is no memory for MP3 required`、ret `10` | 内存不足，Opus 未释放或余量被别处吃掉 |
-| `refusing to stream: only ...B internal heap free` | 低于 12KB 阈值，主动不开流（UI 提示 `low memory`） |
+| `refusing to stream: only ...B free` / `StartStream refuse: heap` | 总空闲低于 12KB，主动不开流（UI 提示 `low memory`） |
+| `StartStream: largest ... < 20KB (trying decoder anyway)` | 最大块偏小但仍尝试；随后看 `mp3 decoder open ok` 或 `MEM_LACK` |
 | `getaddrinfo() returns 202` / `HTTP_CLIENT: Allocation failed` | 内存已见底，随后大概率重启 |
 | `decoder info not ready (N) - holding output` | parser 还没锁到帧，正在静音等待（少量正常） |
 | `unsupported bits_per_sample=...; refusing to play` | 格式不符，主动静音而非播噪音 |
@@ -114,9 +115,179 @@ pcm chunks=200 44100->24000Hz ch=2 vol=85 heap=...
 - 控制台必须保持开启（`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` + `LOG_DEFAULT_LEVEL_INFO`）：早期 `CONFIG_ESP_CONSOLE_NONE=y` 使 panic handler 无处输出，重启循环里连 backtrace 都看不到。配合 `ESP_SYSTEM_PANIC_PRINT_REBOOT` 与 5 秒延迟，让 USB-CDC 有时间冲出 backtrace。
 - 改分区表后需整包烧录：`./flash.sh`，串口另开 `./monitor.sh`（见 [build/flash.md](../build/flash.md)）。
 
+## 进出页二次进入无声
+
+### 现象
+
+- 开机直接进 Radio → 可播放
+- **从 Car / Music / Launcher 切回 Radio** → 无声 / 一直 connecting / `low memory`
+- 离开后再回 Chat，TTS/语音应仍可用
+
+### 根因（两层）
+
+1. **HTTP 僵尸任务（旧）**：`StopStream` 在 `esp_http_client` 阻塞时过早清空句柄并 `RestoreAudioModels`，MP3 与 Opus 双占用把无 PSRAM 堆吃光。已用 `AbortActiveHttp` + 严格 join + `enter_gen_` 处理。
+
+2. **独占页互切仍 Rebuild Opus（本次主因）**：用户路径是 Radio ↔ Car / Music，不是单纯 Radio→Chat。旧逻辑在 **每次** Radio `OnLeave` 都 `RestoreAudioModels`（~43KB），下一页（Car 不占音频；Music 只抢麦）根本用不到 Opus；再进 Radio 又 `Release`。无 PSRAM 上这轮 Restore→Release **碎片化最大空闲块**，二次进页 MP3 真解码（首帧分配）失败或开流被拒。Music `OnLeave` 再调 `RestoreAudioRouting` 会加重：重建 Opus + 可能留下 `EnableInput(true)` 的 duplex RX。
+
+### 修复（`fix/radio-reenter-audio`）
+
+**流任务 / join（保留）**
+
+- `AbortActiveHttp()` + join 上限 `kHttpTimeoutMs + 2000`；超时不提前 Restore Opus
+- `enter_gen_` 作废陈旧 `StartStream`；`StartStream` 先 drain 残留任务
+
+**独占页音频状态机（本次）**
+
+- Radio `ReleaseAudioExclusive`：**只**关掉 `SetExternalPlaybackActive` / 关 input，**不** `RestoreAudioModels`
+- Music `ReleaseMicExclusive`：`EnableInput(false)`，**不** `RestoreAudioRouting`
+- `PageManager::ScheduleChatAudioRestore`：仅在 `ShowPage(Chat)` 完成、`switching_` 已清、Chat UI 已显示后，用 `Application::Schedule` 延迟一拍再 `RestoreAudioModels` + `RestoreAudioRouting` + `EnableInput` / 唤醒词 / 语音处理。Radio/Music `OnLeave` **绝不** Restore
+- 仅当曾经 `ReleaseAudioModels` 才重建 Opus；开机 `Initialize` 不走 Chat `OnEnter` / Restore：`SetupUI` 早于 `AudioService::Initialize`，`codec_` 仍为空会 `LoadProhibited` 黑屏复位
+- Radio `CaptureAudioExclusive`：强制 `EnableInput(false)` + `ReleaseAudioModels`（幂等）+ 外部播放 hold
+- `ReleaseAudioModels` 先清空编解码队列，再关 Opus，避免队列缓冲残留占堆
+
+串口应能看到：`OnLeave` → `audio exclusive OFF (models deferred)` →（Car/Music 无 Opus restore）→ 再进 `OnEnter` → `released audio models`（常为 enc=0 dec=0）→ `mp3 decoder open ok` → `self-test tone` → `pcm chunks=…`。Fn+1 回 Chat：`ShowPage leave … ok` → `Chat audio restore done` + `restored audio models` + `RestoreAudioRouting`。
+
+### Radio → Fn+1 Chat 卡在「聆听中」
+
+#### 现象
+
+Radio 能播；**Fn+1 回到 Chat 后按 Enter 说话**，状态栏一直「聆听中」，听不到自己、也收不到回复。开机不黑屏；Radio 仍应能播。
+
+#### 根因（两层，7bd1afb 只修了第一层）
+
+1. **Opus 编/解码器被 Radio `ReleaseAudioModels` 关掉**（约 43KB）。本板 `CONFIG_WAKE_WORD_DISABLED=y`，无 AFE/VAD，聆听靠按键进入，上行是 PCM → **encoder** → 服务器。只 Restore decoder 或 Restore 被丢掉时，包发不出去，服务器不回 TTS，UI 一直聆听。
+2. **ES8311 RX DMA 在 Radio 期间饿死**：Radio 只 `Write` PCM、`EnableInput(false)`，但 IN_OUT 句柄因喇叭仍开而不 delete。`EnableInput(true)` 复用旧句柄后 `esp_codec_dev_read` 卡住或读到空数据。7bd1afb 的 `ScheduleChatAudioRestore` 若因 `IsChatUiVisible` 失败会**永久丢掉** Restore；`StopStream` 超时后的 deferred leave 还会再 `EnableInput(false)` 把麦关掉。
+
+#### 修复
+
+- Radio/Music Leave：**不** `RestoreAudioModels`；`ReleaseAudioExclusive` **不再** `EnableInput(false)`（避免晚到的 join 把 Chat 的麦关掉）
+- `ShowPage(Chat)` 完成后 `ScheduleChatAudioRestore`：Chat UI 不可见时仍 Restore（只告警）；`switching_` 时最多再 defer 2 次；**未 `ReleaseAudioModels` 则整段跳过**（开机 Chat 不得 RecycleDevice）
+- `RestoreAudioRouting`：仅 `was_released` 时 **先** `RecycleDevice`（close+delete + I2S disable + 再 open）**再** 成对重建 encoder+decoder，然后按 DeviceState 重绑 VP。勿用 `!input || !output` 当 Recycle 条件（开机 codec 本来就是关的）
+- 进入 listening 时若 encoder 仍空，再补一次 Restore；`EnableVoiceProcessing(true)` 同样会补
+
+串口对照（成功）：
+
+```
+ShowPage leave 9 -> 1 ok
+Chat audio restore run state=... released=1 enc=0 dec=0
+RecycleDevice done dev=0x... in=1 out=1
+restored audio models enc=0x... dec=0x... enc_ok=1 dec_ok=1 released=0
+RestoreAudioRouting done state=... enc=1 dec=1 in=1 out=1 vp=0
+Chat audio restore done ... enc=1 dec=1 in=1 out=1
+```
+
+按 Enter 后应有 `listening: enc=1 dec=1 in=1 ... vp=1`，随后 `in_cnt` / `enc_cnt` 增加。若停在聆听：查是否出现 `Chat audio restore dropped`、`failed to re-open opus encoder`、`EnableVoiceProcessing: opus missing`、`Failed to encode audio: encoder not configured`。
+
+开机 Chat 串口应有 `Chat audio restore skipped: never released`（若误调了 Restore），**不应**出现 `RecycleDevice begin`。
+
+### 开机 Chat 听不到（3c90d98 回归）
+
+#### 现象
+
+刚烧录含 `RecycleDevice` 的固件后，**开机进 Chat 按 Enter 完全听不到**。此前开机 Chat 能对话；回归前的问题只是 Radio → Fn+1 Chat 卡在「聆听中」。
+
+#### 根因
+
+`RestoreAudioRouting` 用 `was_released || !input_enabled || !output_enabled` 决定是否 `RecycleDevice`。开机 codec 刚 `Initialize`，input/output 默认关，`models_released_` 为 false，但 `!in || !out` 仍为真。一旦 `ScheduleChatAudioRestore` 在开机路径跑到（ShowPage/Recover/误接 OnEnter），就会对**从未 Release、刚打开**的 ES8311 做 close+delete+I2S disable 再 open：RX 弄坏或时序错乱，`EnableInput` 看起来成功但读不到 PCM。
+
+#### 修复
+
+- `ScheduleChatAudioRestore`：未 `ReleaseAudioModels` 直接 return（开机 / Car / Launcher 回 Chat）
+- `RestoreAudioRouting`：`RecycleDevice` + `RestoreAudioModels` **仅** `was_released`
+- 开机 `PageManager::Initialize` 仍只 `ShowChatUi`，不走 Chat `OnEnter` Restore（避免 `codec_` 仍空时黑屏）
+
+### Music → Launcher → Radio 仍无声
+
+Music 路径已修（DestroyPanel + 放麦）。**1–4 / 5 经 Launcher 进 Radio 仍会无声**——见下一节。原先只有经过 Music 再经 Launcher 进 Radio 会失败。Music 没有 FFT / `SetReadSampleRate`，频谱是 512 sample 时域能量。真正占内部 SRAM 的是：
+
+1. **`mic_buf_` 离页不释放**（512×2B），以及 24 根柱 + 网格的 LVGL 面板只 hidden、不 Destroy。Launcher 既不 Release 也不 Restore，Music 残留一直在；再叠 Radio 面板后最大空闲块不够 MP3 真解码。
+2. **Tick 在 `esp_timer` 上阻塞 `esp_codec_dev_read`**，主任务 `OnLeave` 可并发 `EnableInput(false)` 关掉 `dev_`（Read 原先不加锁）。未完成的 RX 会把 DMA/软件缓冲留在堆上。
+3. **ES8311 `UpdateDeviceState` 只 close 不 delete**：Music 开麦（IN_OUT `esp_codec_dev_new`）再关麦后句柄泄漏；15s 省电门还会反复 new/close（Music 不走 `ReadAudioData`，`last_input_time_` 不刷新）。
+
+**修复**
+
+- Music `OnLeave`：等 in-flight capture → `EnableInput(false)` → 释放 `mic_buf_` → **DestroyPanel**；打 heap / largest
+- `NotifyInputActivity()` 防止省电门中途关 RX
+- ES8311：`Read`/`Write` 与 `EnableInput` 同锁；close 后 `esp_codec_dev_delete`
+- Radio：`OnEnter` / Capture 打 free+largest；`open`/`process` 失败打 `MEM_LACK`（`ESP_AUDIO_ERR_MEM_LACK=-2`）并立刻放弃，不再空转 connecting
+
+串口对照：`OnLeave Music after mic release` → `after panel destroy` → `codec device closed+deleted` → Radio `OnEnter ... heap= ... largest=` → `mp3 decoder open ok` → `pcm chunks=`。
+
+
+### 1–4 / 5 → Launcher → Radio 无声
+
+启动器数字：1 Car / 2 SpiderBot / 3 IceBox / 4 Clock / 5 Rain / 6 Music / 7 Radio。
+
+**能播：** 6 Music → 导航(Launcher) → 7 Radio（Music Leave 已 DestroyPanel）
+**不能播（修前）：** 1–4 任意页 → 导航 → 7 Radio。5 Rain 同构（Matrix canvas），一并修。
+
+#### 根因
+
+PageManager `ShowPage` 对独占页 Leave **只 hidden、不 Destroy**（为防 IceBox→Car 同一次切页里 Destroy+重建卡死 LVGL）。经 Launcher 进 Radio 时，旧 panel 仍占内部 SRAM，再叠 Launcher（复用）+ Radio（24 柱），**最大空闲块**不够 MP3 真解码（`esp_audio_simple_dec_open` 仍可能成功，第一帧才 `MEM_LACK`）。
+
+MQTT 客户端开机常驻，离页不断开。IceBox IR worker（4KB 栈 + `IRMitsubishiAC`）第一次进页后常驻，`Cancel` 只停发送。Clock/Matrix 的 RGB565 **canvas 是成员 BSS**（Clock 182×54×2 ≈ 19.6KB，Matrix 120×68×2 ≈ 16.3KB），开机就占着，Destroy panel **腾不出**这块——只能释放 LVGL 对象。
+
+| 页 | 离页（修前） | 堆上大约（LVGL，进页才有） | 常驻（与是否进页无关） |
+|----|--------------|------------------------------|------------------------|
+| 1 Car | hidden | ~30 个对象（仪表盘+车身+轮辐），约 **8–15KB** | MQTT 客户端（全局） |
+| 2 Spider | hidden | ~24 个对象，约 **8–12KB** | 同上 MQTT |
+| 3 IceBox | hidden + IR Cancel | ~30 个对象（6 键×3 + 左右栏），约 **8–15KB** | 首次进页后 IR task 4KB 栈 |
+| 4 Clock | hidden | panel+canvas 对象约 **1–3KB** | canvas BSS **19.6KB** |
+| 5 Rain | hidden | 同上约 **1–3KB** | canvas BSS **16.3KB** |
+| 6 Music | DestroyPanel | 24 柱+网格，约 **10–15KB**（已释放） | — |
+| Launcher | hidden 复用（进 Radio 前 Destroy） | MYJ 点阵+7 按钮，较重；与 Radio 24 柱叠在一起会压垮 largest | — |
+
+Car/IceBox 的 hidden 仪表盘才是 1–4→Radio 的主因；Clock/Matrix 对象虽小，hidden panel 仍碎片化最大块，故同样 Destroy。
+
+#### 修复
+
+- **Clock / Matrix**：`OnLeave` 一律 `DestroyPanel`（重建便宜；canvas BSS 仍在）
+- **Car / Spider / IceBox**：`PageManager` 在 Leave 之后调用 `ReleaseResidentUi`（`lv_obj_del`），**仅当下一页不是 Car/Spider/IceBox**。仪表盘互切仍复用 panel，避免 IceBox→Car 卡死回归
+- Launcher 在进 **非 Radio** 页时仍 hidden 复用；**进 Radio 前 sweep Destroy**（含 Launcher）
+- Radio 离页 **DestroyPanel**（不再 hidden 常驻 24 柱）
+- 日志：各页 Leave 后 `heap`/`largest`；Radio `OnEnter` / Capture / `MEM_LACK`；`StartStream` 若 `largest < 20KB` **只告警仍尝试**，真失败看 decoder `MEM_LACK`
+
+串口对照：`release resident UI` → `ReleaseResidentUi dashboard heap A->B largest C->D`（或 Clock/Matrix/IceBox `DestroyPanel`）→ Radio `OnEnter ... largest=` → `heap after capture` → `mp3 decoder open ok` → `pcm chunks=`。
+
+#### 测试矩阵
+
+- [ ] 1 Car → Launcher → 7 Radio
+- [ ] 2 Spider → Launcher → 7 Radio
+- [ ] 3 IceBox → Launcher → 7 Radio
+- [ ] 4 Clock → Launcher → 7 Radio
+- [ ] 5 Rain → Launcher → 7 Radio
+- [ ] 6 Music → Launcher → 7 Radio（回归仍能播）
+- [ ] 开机直进 7 Radio
+- [ ] Radio → Chat 语音仍可用
+- [ ] IceBox → Launcher → Car（切页不卡死）
+- [ ] 来回切 1–7 与 Launcher **至少 10 次** 后再进 Radio，仍能播（不应再 `stream err / low memory`）
+
+### 切几下就 stream err / low memory
+
+#### 现象
+
+开机 Radio 能播；在 1–7 与 Launcher 之间切几次再进 Radio，UI 显示 **stream err / low memory**，无法继续播放。
+
+#### 根因（门槛误杀 + 面板常驻碎片化，不是 decoder/HTTP 泄漏）
+
+1. **Radio / Launcher 离页只 hidden、不 Destroy**。Radio 24 柱 + Launcher MYJ 点阵各约 8–15KB LVGL 对象，第一次进过之后一直占着内部 SRAM。Car/Clock/Music 在旁边反复 Build/Destroy，把 **最大空闲块** 碎片化到 20KB 以下。
+2. **`kMinLargestToStream = 20KB` 预检过严**：切几次后 `largest` 掉到 12–18KB 就直接 `low memory`，其实 Helix 仍可能解码成功。decoder / HTTP / stream task / `vis_buf`（任务栈上）进出页是成对的，没有叠开第二路流。
+3. `BuildPanel` 在 `panel_ != nullptr` 时直接 return，**不会每次进 Radio 新建 24 柱**；问题是旧面板从不释放。
+
+`heap_caps_malloc_extmem_enable` 与本板无关（无 PSRAM）。
+
+#### 修复
+
+- Radio `OnLeave`：`StopStream` 后 **DestroyPanel**（decoder/http/task 仍由 StopStream 成对关闭）
+- 进 Radio 前 `PageManager::ReleaseOtherExclusiveUi`：**Destroy 所有其他独占页**（含 Launcher）；只留 Chat UI + 当前 Radio
+- 进 Radio 时先 `CaptureAudioExclusive`（释放 Opus）再 BuildPanel，让后续 MP3 拿到更大连续块
+- `largest < 20KB` 改为告警，**仍尝试开流**；只有总空闲 < 12KB 或 decoder `MEM_LACK` / `xTaskCreate` 失败才报错
+
+串口对照：`sweep destroy page 5`（Launcher）→ `DestroyPanel launcher heap/largest` → Radio `OnEnter` → `audio exclusive ON` → `mp3 decoder open ok` → `pcm chunks=`。切页离开应有 `DestroyPanel radio`。
+
 ## 遗留项
 
 - 稳定态仅剩 **15-20KB** 内部 SRAM，余量不宽裕。
-- 「进 Radio 到离页再聊天语音」的往返**未实测**（Opus 是离页才重建）。
+- 「进 Radio 再 Fn+1 回 Chat 说话」依赖 `ScheduleChatAudioRestore`：仅曾经 `Release` 才 `RecycleDevice` + 成对重建 Opus；开机未 Release 跳过。二次进 Radio 见上文「进出页二次进入无声」。
 - 目前只验证 Music 台 `http://lhttp.qtfm.cn/live/332/64k.mp3`；News 台未逐项确认。
 - 24kHz 最近邻重采样高频有混叠，音质一般但可用。

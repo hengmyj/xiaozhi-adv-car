@@ -140,10 +140,17 @@ void MatrixPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ == nullptr || display == nullptr) {
         return;
     }
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t before_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     DisplayLockGuard lock(display);
     lv_obj_del(panel_);
     panel_ = nullptr;
     canvas_ = nullptr;
+    ESP_LOGI(TAG, "DestroyPanel matrix heap %u->%u largest %u->%u (canvas BSS %u stays)",
+             (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)before_largest,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)sizeof(canvas_buf_));
 }
 
 void MatrixPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
@@ -151,9 +158,10 @@ void MatrixPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
         return;
     }
 
-    ESP_LOGI(TAG, "BuildPanel canvas %dx%d buf=%u heap=%u", kCanvasW, kCanvasH,
+    ESP_LOGI(TAG, "BuildPanel canvas %dx%d buf=%u heap=%u largest=%u", kCanvasW, kCanvasH,
              static_cast<unsigned>(sizeof(canvas_buf_)),
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
 
     DisplayLockGuard lock(display);
     panel_ = lv_obj_create(display->GetScreen());
@@ -255,8 +263,9 @@ void MatrixPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     display_ = display;
     active_ = true;
     stepping_ = false;
-    ESP_LOGI(TAG, "OnEnter matrix canvas reuse=%d heap=%u", panel_ != nullptr ? 1 : 0,
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+    ESP_LOGI(TAG, "OnEnter matrix canvas reuse=%d heap=%u largest=%u", panel_ != nullptr ? 1 : 0,
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
 
     BuildPanel(display);
     if (panel_ == nullptr) {
@@ -278,18 +287,22 @@ void MatrixPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     }
     display->HideChatUi();
     StepAnimation(display);
-    ESP_LOGI(TAG, "OnEnter done heap=%u",
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+    ESP_LOGI(TAG, "OnEnter done heap=%u largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
 }
 
 void MatrixPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
     active_ = false;
     stepping_ = false;
-    if (display == nullptr || panel_ == nullptr) {
-        return;
-    }
-    DisplayLockGuard lock(display);
-    lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
+    ESP_LOGI(TAG, "OnLeave matrix heap=%u largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+    DestroyPanel(display);
+}
+
+void MatrixPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    DestroyPanel(display);
 }
 
 void MatrixPage::Tick(CardputerAdvCarLcdDisplay* display) {

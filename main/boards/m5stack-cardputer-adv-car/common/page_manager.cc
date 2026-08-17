@@ -1,6 +1,7 @@
 #include "page_manager.h"
 
 #include "application.h"
+#include "board.h"
 #include "cardputer_adv_lcd_display.h"
 #include "display/display.h"
 
@@ -15,8 +16,33 @@ size_t FreeHeap() {
     return heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 }
 
+size_t LargestHeap() {
+    return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+}
+
 bool PanelVisible(lv_obj_t* panel) {
     return panel != nullptr && !lv_obj_has_flag(panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+bool IsDashboardPage(PageId id) {
+    return id == PageId::Car || id == PageId::Spider || id == PageId::MjAc;
+}
+
+// Keep Car/Spider/IceBox panels when switching among them (IceBox→Car used to
+// freeze LVGL). Clock/Matrix/dashboards going to Launcher/Chat/Radio must drop
+// the hidden panel so MP3 can get a contiguous internal-SRAM block.
+bool ShouldReleaseResidentUi(PageId from, PageId to) {
+    if (IsDashboardPage(from) && IsDashboardPage(to)) {
+        return false;
+    }
+    // Drop the hidden Launcher (46 objs, ~10KB) when entering the memory-hungry
+    // games — no-PSRAM heap was ~11KB with it resident, too low for image draws.
+    if (from == PageId::Launcher && (to == PageId::Snake || to == PageId::Dino)) {
+        return true;
+    }
+    return from == PageId::Car || from == PageId::Spider || from == PageId::MjAc ||
+           from == PageId::Clock || from == PageId::Matrix || from == PageId::Snake ||
+           from == PageId::Dino;
 }
 
 }  // namespace
@@ -25,9 +51,9 @@ void ChatPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     if (display != nullptr) {
         display->ShowChatUi();
     }
-    // Re-sync after Radio/Music steal the codec. Safe on boot too (wake word
-    // Enable* no-ops until models are ready).
-    Application::GetInstance().RestoreAudioRouting();
+    // UI only. Do not RestoreAudioModels here: ShowPage still has switching_
+    // set, and Radio/Music may still be tearing down. Opus/mic rebuild is
+    // ScheduleChatAudioRestore after ShowPage clears switching_.
 }
 
 void ChatPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
@@ -44,7 +70,12 @@ void PageManager::Initialize(CardputerAdvCarLcdDisplay* display, EmqxCarMqtt* mq
         Application::GetInstance().Schedule([this, id]() { ShowPage(id); });
     });
     current_ = PageId::Chat;
-    chat_page_.OnEnter(display_);
+    // Show Chat UI only. Do not ChatPage::OnEnter / ScheduleChatAudioRestore:
+    // Application::Initialize calls SetupUI before AudioService::Initialize,
+    // so codec_ is still null (9a6221b RestoreAudioModels → LoadProhibited).
+    if (display_ != nullptr) {
+        display_->ShowChatUi();
+    }
 }
 
 Page* PageManager::GetPage(PageId id) {
@@ -67,18 +98,53 @@ Page* PageManager::GetPage(PageId id) {
             return &cursor_page_;
         case PageId::Radio:
             return &radio_page_;
+        case PageId::Snake:
+            return &snake_page_;
+        case PageId::Dino:
+            return &dino_page_;
         default:
             return nullptr;
     }
 }
 
+void PageManager::ReleaseOtherExclusiveUi(PageId keep) {
+    static const PageId kExclusive[] = {
+        PageId::Car,      PageId::Spider, PageId::MjAc,  PageId::Launcher,
+        PageId::Clock,    PageId::Matrix, PageId::Music, PageId::Radio,
+        PageId::Snake,    PageId::Dino,
+    };
+    const size_t before = FreeHeap();
+    const size_t before_largest = LargestHeap();
+    int n = 0;
+    for (PageId id : kExclusive) {
+        if (id == keep) {
+            continue;
+        }
+        Page* page = GetPage(id);
+        if (page == nullptr || page->GetRootPanel() == nullptr) {
+            continue;
+        }
+        ESP_LOGI(TAG, "sweep destroy page %d heap=%u largest=%u", static_cast<int>(id),
+                 static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
+        page->ReleaseResidentUi(display_);
+        ++n;
+    }
+    ESP_LOGI(TAG, "sweep destroyed %d exclusive panels keep=%d heap %u->%u largest %u->%u", n,
+             static_cast<int>(keep), static_cast<unsigned>(before),
+             static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(before_largest),
+             static_cast<unsigned>(LargestHeap()));
+}
+
 void PageManager::RecoverToChat(const char* reason) {
-    ESP_LOGE(TAG, "RecoverToChat: %s (was page %d) heap=%u", reason, static_cast<int>(current_),
-             static_cast<unsigned>(FreeHeap()));
+    ESP_LOGE(TAG, "RecoverToChat: %s (was page %d) heap=%u largest=%u", reason,
+             static_cast<int>(current_), static_cast<unsigned>(FreeHeap()),
+             static_cast<unsigned>(LargestHeap()));
     Page* stuck = GetPage(current_);
     if (stuck != nullptr && current_ != PageId::Chat) {
-        // OnLeave first (Music restores mic/AFE; Radio stops stream; hide failed panel).
+        // OnLeave first (Music drops mic; Radio stops stream; hide failed panel).
+        // Never RestoreAudioModels here — wait until Chat UI is shown.
         stuck->OnLeave(display_);
+        stuck->ReleaseResidentUi(display_);
     }
     current_ = PageId::Chat;
     chat_page_.OnEnter(display_);
@@ -96,6 +162,72 @@ void PageManager::RecoverToChat(const char* reason) {
             }
         }
     }
+    if (current_ == PageId::Chat) {
+        ScheduleChatAudioRestore();
+    }
+}
+
+void PageManager::ScheduleChatAudioRestore(int retry) {
+    // Next main-loop tick: ShowPage has returned, switching_ is already false,
+    // Chat UI is on screen. Never from Radio/Music OnLeave. No-op until
+    // ReleaseAudioModels — boot Initialize / first Chat must not RecycleDevice.
+    Application::GetInstance().Schedule([this, retry]() {
+        if (switching_) {
+            if (retry < 2) {
+                ESP_LOGW(TAG, "Chat audio restore deferred switching retry=%d", retry);
+                ScheduleChatAudioRestore(retry + 1);
+            } else {
+                ESP_LOGE(TAG, "Chat audio restore dropped: still switching page=%d",
+                         static_cast<int>(current_));
+            }
+            return;
+        }
+        if (current_ != PageId::Chat) {
+            ESP_LOGW(TAG, "Chat audio restore dropped page=%d", static_cast<int>(current_));
+            return;
+        }
+        if (display_ == nullptr || !display_->IsChatUiVisible()) {
+            ESP_LOGW(TAG, "Chat audio restore: Chat UI not visible, restoring audio anyway");
+            if (display_ != nullptr) {
+                display_->ShowChatUi();
+            }
+        }
+        auto& app = Application::GetInstance();
+        auto& audio = app.GetAudioService();
+        auto* codec = Board::GetInstance().GetAudioCodec();
+        if (codec == nullptr) {
+            ESP_LOGW(TAG, "Chat audio restore skipped: codec null");
+            return;
+        }
+        if (!audio.AudioModelsReleased()) {
+            ESP_LOGI(TAG,
+                     "Chat audio restore skipped: never released enc=%d dec=%d (boot-safe)",
+                     audio.HasOpusEncoder() ? 1 : 0, audio.HasOpusDecoder() ? 1 : 0);
+            return;
+        }
+        ESP_LOGI(TAG,
+                 "Chat audio restore run state=%d released=%d enc=%d dec=%d ext=%d in=%d out=%d",
+                 static_cast<int>(app.GetDeviceState()), audio.AudioModelsReleased() ? 1 : 0,
+                 audio.HasOpusEncoder() ? 1 : 0, audio.HasOpusDecoder() ? 1 : 0,
+                 audio.IsExternalPlaybackActive() ? 1 : 0, codec->input_enabled() ? 1 : 0,
+                 codec->output_enabled() ? 1 : 0);
+        app.RestoreAudioRouting();
+        if (!codec->input_enabled()) {
+            codec->EnableInput(true);
+        }
+        if (!codec->output_enabled()) {
+            codec->EnableOutput(true);
+        }
+        const auto& stats = audio.GetDebugStatistics();
+        ESP_LOGI(TAG,
+                 "Chat audio restore done heap=%u largest=%u in=%d out=%d enc=%d dec=%d ww=%d vp=%d "
+                 "in_cnt=%u enc_cnt=%u",
+                 static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()),
+                 codec->input_enabled() ? 1 : 0, codec->output_enabled() ? 1 : 0,
+                 audio.HasOpusEncoder() ? 1 : 0, audio.HasOpusDecoder() ? 1 : 0,
+                 audio.IsWakeWordRunning() ? 1 : 0, audio.IsAudioProcessorRunning() ? 1 : 0,
+                 stats.input_count, stats.encode_count);
+    });
 }
 
 void PageManager::ShowPage(PageId id) {
@@ -116,8 +248,9 @@ void PageManager::ShowPage(PageId id) {
 
     switching_ = true;
     const PageId prev = current_;
-    ESP_LOGI(TAG, "ShowPage enter %d -> %d heap=%u", static_cast<int>(prev), static_cast<int>(id),
-             static_cast<unsigned>(FreeHeap()));
+    ESP_LOGI(TAG, "ShowPage enter %d -> %d heap=%u largest=%u", static_cast<int>(prev),
+             static_cast<int>(id), static_cast<unsigned>(FreeHeap()),
+             static_cast<unsigned>(LargestHeap()));
 
     if (id == PageId::Chat && mqtt_ != nullptr && mqtt_->run() != 0) {
         mqtt_->PublishCarCmd(0, mqtt_->speed());
@@ -127,9 +260,23 @@ void PageManager::ShowPage(PageId id) {
     // still enters first so HideChatUi never leaves a WiFi-only blank frame.
     if (prev != PageId::Chat) {
         current->OnLeave(display_);
+        if (ShouldReleaseResidentUi(prev, id)) {
+            ESP_LOGI(TAG, "release resident UI %d before %d heap=%u largest=%u",
+                     static_cast<int>(prev), static_cast<int>(id),
+                     static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
+            current->ReleaseResidentUi(display_);
+            ESP_LOGI(TAG, "released resident UI %d heap=%u largest=%u", static_cast<int>(prev),
+                     static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
+        }
+        if (id == PageId::Radio) {
+            ReleaseOtherExclusiveUi(PageId::Radio);
+        }
         current_ = id;
         next->OnEnter(display_);
     } else {
+        if (id == PageId::Radio) {
+            ReleaseOtherExclusiveUi(PageId::Radio);
+        }
         current_ = id;
         next->OnEnter(display_);
         current->OnLeave(display_);
@@ -139,7 +286,8 @@ void PageManager::ShowPage(PageId id) {
         if (!display_->IsChatUiVisible()) {
             RecoverToChat("chat UI still hidden after switch to Chat");
             switching_ = false;
-            ESP_LOGI(TAG, "ShowPage leave (recovered) heap=%u", static_cast<unsigned>(FreeHeap()));
+            ESP_LOGI(TAG, "ShowPage leave (recovered) heap=%u largest=%u",
+                     static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
             return;
         }
     } else {
@@ -147,7 +295,8 @@ void PageManager::ShowPage(PageId id) {
         if (!PanelVisible(panel)) {
             RecoverToChat("next page panel null/hidden after OnEnter");
             switching_ = false;
-            ESP_LOGI(TAG, "ShowPage leave (recovered) heap=%u", static_cast<unsigned>(FreeHeap()));
+            ESP_LOGI(TAG, "ShowPage leave (recovered) heap=%u largest=%u",
+                     static_cast<unsigned>(FreeHeap()), static_cast<unsigned>(LargestHeap()));
             return;
         }
         // Keep exclusive panel above any chat chrome that UpdateStatusBar may touch.
@@ -155,9 +304,13 @@ void PageManager::ShowPage(PageId id) {
         lv_obj_move_foreground(panel);
     }
 
-    ESP_LOGI(TAG, "ShowPage leave %d -> %d ok heap=%u", static_cast<int>(prev),
-             static_cast<int>(current_), static_cast<unsigned>(FreeHeap()));
+    ESP_LOGI(TAG, "ShowPage leave %d -> %d ok heap=%u largest=%u", static_cast<int>(prev),
+             static_cast<int>(current_), static_cast<unsigned>(FreeHeap()),
+             static_cast<unsigned>(LargestHeap()));
     switching_ = false;
+    if (current_ == PageId::Chat) {
+        ScheduleChatAudioRestore();
+    }
 }
 
 void PageManager::RefreshCurrentPage() {
@@ -215,6 +368,10 @@ void PageManager::Tick() {
         radio_page_.Tick(display_);
     } else if (current_ == PageId::Launcher) {
         launcher_page_.Tick(display_);
+    } else if (current_ == PageId::Snake) {
+        snake_page_.Tick(display_);
+    } else if (current_ == PageId::Dino) {
+        dino_page_.Tick(display_);
     }
 }
 
@@ -240,6 +397,12 @@ bool PageManager::HandleVehicleKey(const KeyEvent& event) {
     }
     if (current_ == PageId::Radio) {
         return radio_page_.HandleKey(event);
+    }
+    if (current_ == PageId::Snake) {
+        return snake_page_.HandleKey(event);
+    }
+    if (current_ == PageId::Dino) {
+        return dino_page_.HandleKey(event);
     }
     return false;
 }

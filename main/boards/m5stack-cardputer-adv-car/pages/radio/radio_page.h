@@ -26,6 +26,7 @@ class RadioPage : public Page {
 public:
     void OnEnter(CardputerAdvCarLcdDisplay* display) override;
     void OnLeave(CardputerAdvCarLcdDisplay* display) override;
+    void ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) override;
     void Tick(CardputerAdvCarLcdDisplay* display);
     bool HandleKey(const KeyEvent& event);
     lv_obj_t* GetRootPanel() const override { return panel_; }
@@ -39,9 +40,14 @@ public:
     bool IsUserPaused() const { return user_paused_.load(); }
     int StationIndex() const { return station_index_.load(); }
     uint32_t StationGeneration() const { return station_gen_.load(); }
+    // Stream task publishes its HTTP client so OnLeave can close the socket and
+    // unblock open/read without deleting the task.
+    void PublishActiveHttp(void* client);
+    void ClearActiveHttp(void* expect);
 
 private:
     void BuildPanel(CardputerAdvCarLcdDisplay* display);
+    void DestroyPanel(CardputerAdvCarLcdDisplay* display);
     void UpdateUi(CardputerAdvCarLcdDisplay* display);
     void StartStream();
     void StopStream();
@@ -50,6 +56,8 @@ private:
     void SelectStation(int index);
     void TogglePause();
     void AdjustVolume(int delta);
+    void AbortActiveHttp();
+    bool WaitStreamExit(TickType_t ticks, const char* why);
 
     static void StreamTask(void* arg);
 
@@ -72,9 +80,16 @@ private:
     std::atomic<RadioPlayState> play_state_{RadioPlayState::Idle};
     std::atomic<bool> stream_run_{false};
     std::atomic<bool> user_paused_{false};
+    std::atomic<bool> stream_alive_{false};
     std::atomic<int> station_index_{1};
     std::atomic<uint32_t> station_gen_{0};
+    // Bumped on every OnEnter/OnLeave so a deferred StartStream from a prior visit
+    // cannot start audio after the user has already left (or left and come back).
+    std::atomic<uint32_t> enter_gen_{0};
     std::atomic<float> level_{0.0f};
+    // esp_http_client_handle_t published by the stream task so StopStream can
+    // close the socket and unblock a stuck open/read without vTaskDelete.
+    std::atomic<void*> active_http_{nullptr};
     char status_hint_[40] = {};
 
     // The stream task never touches its own handle; it only gives stream_done_ on

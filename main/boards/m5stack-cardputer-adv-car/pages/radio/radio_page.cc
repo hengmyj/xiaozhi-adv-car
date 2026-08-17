@@ -69,14 +69,59 @@ constexpr int kPcmOutMax = 8 * 1024;
 constexpr int kTaskStack = 5120;
 constexpr int kResampleChunk = 512;     // stack-resident, keeps another vector off the heap
 constexpr size_t kMinHeapToStream = 12 * 1024;
+// Helix MP3 true-decode wants ~16–20KB contiguous, but after a few page
+// switches the largest block often sits at 12–18KB from LVGL fragmentation
+// while the decoder can still succeed. Do not refuse on largest; warn and
+// let open/process report MEM_LACK. Task create still needs a stack-sized hole.
+constexpr size_t kWarnLargestToStream = 20 * 1024;
 constexpr int kTaskPrio = 3;
 // LVGL runs at priority 1 pinned to core 1 (see lcd_display.cc task_affinity=1), so a
 // higher-priority streaming task on core 1 starves it outright and trips the task
 // watchdog on taskLVGL. Keep this off core 1.
 constexpr int kTaskCore = 0;
 constexpr int kHttpTimeoutMs = 6000;
+// Join must outlast a blocked esp_http_client open/read (timeout_ms above). With
+// AbortActiveHttp the wait is usually ms; this is the pathological ceiling.
+constexpr int kStreamJoinMs = kHttpTimeoutMs + 2000;
 constexpr int kDefaultVolume = 85;
 constexpr uint32_t kNoPcmAbortBytes = 48 * 1024;
+
+size_t InternalHeapFree() {
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+}
+
+size_t InternalHeapLargest() {
+    return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+}
+
+const char* AudioErrName(esp_audio_err_t err) {
+    switch (err) {
+        case ESP_AUDIO_ERR_OK:
+            return "OK";
+        case ESP_AUDIO_ERR_CONTINUE:
+            return "CONTINUE";
+        case ESP_AUDIO_ERR_FAIL:
+            return "FAIL";
+        case ESP_AUDIO_ERR_MEM_LACK:
+            return "MEM_LACK";
+        case ESP_AUDIO_ERR_DATA_LACK:
+            return "DATA_LACK";
+        case ESP_AUDIO_ERR_HEADER_PARSE:
+            return "HEADER_PARSE";
+        case ESP_AUDIO_ERR_INVALID_PARAMETER:
+            return "INVALID_PARAMETER";
+        case ESP_AUDIO_ERR_ALREADY_EXIST:
+            return "ALREADY_EXIST";
+        case ESP_AUDIO_ERR_NOT_SUPPORT:
+            return "NOT_SUPPORT";
+        case ESP_AUDIO_ERR_BUFF_NOT_ENOUGH:
+            return "BUFF_NOT_ENOUGH";
+        case ESP_AUDIO_ERR_NOT_FOUND:
+            return "NOT_FOUND";
+        default:
+            return "UNKNOWN";
+    }
+}
 
 constexpr int kToneMs = 350;
 constexpr int kToneHz = 440;
@@ -320,9 +365,25 @@ int DecodeBuffered(StreamCtx* ctx, uint8_t* buf, int fill) {
             if (ret != ESP_AUDIO_ERR_OK) {
                 had_error = true;
                 ++ctx->frames_bad;
+                if (ret == ESP_AUDIO_ERR_MEM_LACK) {
+                    ESP_LOGE(TAG,
+                             "decode MEM_LACK ret=%d heap=%u largest=%u pcm_chunks=%u bad=%u",
+                             (int)ret, (unsigned)InternalHeapFree(),
+                             (unsigned)InternalHeapLargest(), (unsigned)ctx->pcm_chunks,
+                             (unsigned)ctx->frames_bad);
+                    if (ctx->pcm_chunks == 0) {
+                        ctx->format_rejected = true;
+                        if (ctx->page != nullptr) {
+                            ctx->page->SetStatusHint("mp3 mem lack");
+                        }
+                    }
+                    break;
+                }
                 if ((ctx->frames_bad % 200) == 1) {
-                    ESP_LOGW(TAG, "decode ret=%d (bad=%u ok=%u)", (int)ret,
-                             (unsigned)ctx->frames_bad, (unsigned)ctx->frames_ok);
+                    ESP_LOGW(TAG, "decode ret=%d (%s) (bad=%u ok=%u heap=%u largest=%u)",
+                             (int)ret, AudioErrName(ret), (unsigned)ctx->frames_bad,
+                             (unsigned)ctx->frames_ok, (unsigned)InternalHeapFree(),
+                             (unsigned)InternalHeapLargest());
                 }
                 // Only bail out if the decoder has never produced a single sample.
                 // A stream start carries ID3 tags and a partial frame, so early
@@ -391,17 +452,19 @@ bool OpenDecoder(StreamCtx* ctx) {
     cfg.use_frame_dec = false;
     cfg.dec_cfg = nullptr;
     cfg.cfg_size = 0;
-    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t before = InternalHeapFree();
+    const size_t before_largest = InternalHeapLargest();
     const esp_audio_err_t ret = esp_audio_simple_dec_open(&cfg, &ctx->dec);
-    const size_t after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t after = InternalHeapFree();
     if (ret != ESP_AUDIO_ERR_OK) {
-        ESP_LOGE(TAG, "mp3 decoder open failed ret=%d (heap was %uB)", (int)ret,
-                 (unsigned)before);
+        ESP_LOGE(TAG, "mp3 decoder open failed ret=%d (%s) heap free=%u largest=%u", (int)ret,
+                 AudioErrName(ret), (unsigned)before, (unsigned)before_largest);
         ctx->dec = nullptr;
         return false;
     }
-    ESP_LOGI(TAG, "mp3 decoder open ok: used %uB, heap %u -> %u", (unsigned)(before - after),
-             (unsigned)before, (unsigned)after);
+    ESP_LOGI(TAG, "mp3 decoder open ok: used %uB, heap %u -> %u (largest %u -> %u)",
+             (unsigned)(before - after), (unsigned)before, (unsigned)after,
+             (unsigned)before_largest, (unsigned)InternalHeapLargest());
     ctx->sample_rate = 0;
     ctx->channels = 0;
     ctx->resample_pos = 0.0;
@@ -441,11 +504,13 @@ bool PlayStationOnce(StreamCtx* ctx, const Station& station, uint32_t bound_gen)
     if (page == nullptr || !page->IsStreamRunning()) {
         return false;
     }
-    const size_t heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t heap = InternalHeapFree();
+    const size_t largest = InternalHeapLargest();
     if (heap < kMinHeapToStream) {
         // Below this, getaddrinfo() fails with EAI_MEMORY and esp_http_client's
         // allocations start returning NULL, which is how this page used to die.
-        ESP_LOGE(TAG, "refusing to stream: only %uB internal heap free", (unsigned)heap);
+        ESP_LOGE(TAG, "refusing to stream: only %uB free (largest=%u)", (unsigned)heap,
+                 (unsigned)largest);
         page->SetStatusHint("low memory");
         vTaskDelay(pdMS_TO_TICKS(1000));
         return false;
@@ -466,16 +531,17 @@ bool PlayStationOnce(StreamCtx* ctx, const Station& station, uint32_t bound_gen)
         page->SetStatusHint("http init fail");
         return false;
     }
+    page->PublishActiveHttp(client);
 
-    ESP_LOGI(TAG, "open %s heap=%u stack_free=%u", station.url,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    ESP_LOGI(TAG, "open %s heap=%u largest=%u stack_free=%u", station.url, (unsigned)heap,
+             (unsigned)largest, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     page->SetStatusHint("connecting");
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "open fail %s", esp_err_to_name(err));
         page->SetStatusHint("connect fail");
+        page->ClearActiveHttp(client);
         esp_http_client_cleanup(client);
         return false;
     }
@@ -484,6 +550,7 @@ bool PlayStationOnce(StreamCtx* ctx, const Station& station, uint32_t bound_gen)
     if (status < 200 || status >= 300) {
         ESP_LOGW(TAG, "HTTP %d", status);
         page->SetStatusHint("http error");
+        page->ClearActiveHttp(client);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return false;
@@ -575,6 +642,7 @@ bool PlayStationOnce(StreamCtx* ctx, const Station& station, uint32_t bound_gen)
         vTaskDelay(1);
     }
 
+    page->ClearActiveHttp(client);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
@@ -650,6 +718,32 @@ void RadioPage::SetStatusHint(const char* hint) {
     std::snprintf(status_hint_, sizeof(status_hint_), "%s", hint);
 }
 
+void RadioPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
+    if (panel_ == nullptr || display == nullptr) {
+        return;
+    }
+    const size_t before = InternalHeapFree();
+    const size_t before_largest = InternalHeapLargest();
+    DisplayLockGuard lock(display);
+    lv_obj_del(panel_);
+    panel_ = nullptr;
+    status_label_ = nullptr;
+    station_label_ = nullptr;
+    listening_label_ = nullptr;
+    play_label_ = nullptr;
+    vol_label_ = nullptr;
+    for (int i = 0; i < kBarCount; ++i) {
+        bars_[i] = nullptr;
+    }
+    ESP_LOGI(TAG, "DestroyPanel radio heap %u->%u largest %u->%u", (unsigned)before,
+             (unsigned)InternalHeapFree(), (unsigned)before_largest,
+             (unsigned)InternalHeapLargest());
+}
+
+void RadioPage::ReleaseResidentUi(CardputerAdvCarLcdDisplay* display) {
+    DestroyPanel(display);
+}
+
 void RadioPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     if (panel_ != nullptr) {
         return;
@@ -720,49 +814,122 @@ void RadioPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -2);
 }
 
-void RadioPage::CaptureAudioExclusive() {
-    if (audio_exclusive_) {
+void RadioPage::PublishActiveHttp(void* client) {
+    active_http_.store(client);
+}
+
+void RadioPage::ClearActiveHttp(void* expect) {
+    void* expected = expect;
+    active_http_.compare_exchange_strong(expected, nullptr);
+}
+
+void RadioPage::AbortActiveHttp() {
+    void* client = active_http_.exchange(nullptr);
+    if (client == nullptr) {
         return;
     }
+    // Close only: the stream task still owns cleanup. Closing the socket unblocks
+    // esp_http_client_open/read so StopStream can join without vTaskDelete.
+    ESP_LOGW(TAG, "AbortActiveHttp: closing socket to unblock stream task");
+    esp_http_client_close(static_cast<esp_http_client_handle_t>(client));
+}
+
+bool RadioPage::WaitStreamExit(TickType_t ticks, const char* why) {
+    if (stream_done_ == nullptr) {
+        return !stream_alive_.load() && stream_task_ == nullptr;
+    }
+    if (!stream_alive_.load() && stream_task_ == nullptr) {
+        // Consume a stale done token left by a prior timed-out join.
+        xSemaphoreTake(stream_done_, 0);
+        return true;
+    }
+    ESP_LOGI(TAG, "WaitStreamExit (%s) alive=%d task=%p", why, stream_alive_.load() ? 1 : 0,
+             stream_task_);
+    if (xSemaphoreTake(stream_done_, ticks) == pdTRUE) {
+        stream_alive_.store(false);
+        return true;
+    }
+    ESP_LOGE(TAG, "WaitStreamExit (%s) timeout alive=%d task=%p heap=%u largest=%u", why,
+             stream_alive_.load() ? 1 : 0, stream_task_, (unsigned)InternalHeapFree(),
+             (unsigned)InternalHeapLargest());
+    return false;
+}
+
+void RadioPage::CaptureAudioExclusive() {
     auto& audio = Application::GetInstance().GetAudioService();
     audio.EnableWakeWordDetection(false);
     audio.EnableVoiceProcessing(false);
-    // Stopping them is not enough. The MP3 decoder core needs ~25KB and this board
-    // has no PSRAM, so the Opus pair (unused while the radio plays) must actually be
-    // freed or esp_mp3_dec fails to init with ESP_AUDIO_ERR_MEM_LACK.
+    // Always re-run Release: Opus may already be freed after a prior Radio visit
+    // (we no longer restore on exclusive leave), or Chat may have rebuilt them.
+    // ReleaseAudioModels is idempotent when null.
+    const size_t before = InternalHeapFree();
+    const size_t before_largest = InternalHeapLargest();
     audio.ReleaseAudioModels();
-    // This is the only thing that should touch codec power: it enables output and
-    // pins it on for as long as the hold is active.
+    const size_t after = InternalHeapFree();
+    const size_t after_largest = InternalHeapLargest();
+    // Hold TX on; force RX off so a leftover Music mic path cannot stall duplex I2S.
     audio.SetExternalPlaybackActive(true);
-    audio_exclusive_ = true;
+    if (audio_exclusive_) {
+        ESP_LOGW(TAG, "audio exclusive re-assert heap %u->%u largest %u->%u", (unsigned)before,
+                 (unsigned)after, (unsigned)before_largest, (unsigned)after_largest);
+    } else {
+        audio_exclusive_ = true;
+        ESP_LOGI(TAG, "audio exclusive ON heap %u->%u largest %u->%u", (unsigned)before,
+                 (unsigned)after, (unsigned)before_largest, (unsigned)after_largest);
+    }
 
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
+        codec->EnableInput(false);
+        if (!codec->output_enabled()) {
+            codec->EnableOutput(true);
+        }
         codec->SetOutputVolume(kDefaultVolume);
-        ESP_LOGI(TAG, "audio exclusive ON vol=%d out=%d in=%d rate=%d", codec->output_volume(),
+        ESP_LOGI(TAG, "codec vol=%d out=%d in=%d rate=%d heap=%u largest=%u", codec->output_volume(),
                  codec->output_enabled() ? 1 : 0, codec->input_enabled() ? 1 : 0,
-                 codec->output_sample_rate());
+                 codec->output_sample_rate(), (unsigned)InternalHeapFree(),
+                 (unsigned)InternalHeapLargest());
     }
 }
 
 void RadioPage::ReleaseAudioExclusive() {
+    // Soft release only: clear the TX hold and drop the exclusive flag. Do NOT
+    // RestoreAudioModels / RestoreAudioRouting here — Radio↔Car/Music would
+    // rebuild Opus (~43KB) just to free it again on the next Radio enter, and
+    // that thrash fragments the no-PSRAM heap so MP3 open/decode fails silently.
+    // Chat rebuilds after ShowPage(Chat) via ScheduleChatAudioRestore.
     if (!audio_exclusive_) {
+        Application::GetInstance().GetAudioService().SetExternalPlaybackActive(false);
+        ESP_LOGI(TAG, "audio exclusive OFF (already clear) heap=%u",
+                 (unsigned)InternalHeapFree());
         return;
     }
     audio_exclusive_ = false;
-    auto& app = Application::GetInstance();
-    app.GetAudioService().SetExternalPlaybackActive(false);
-    // Rebuild the Opus codecs before the chat path can need them again.
-    app.GetAudioService().RestoreAudioModels();
-    app.RestoreAudioRouting();
-    ESP_LOGI(TAG, "audio exclusive OFF");
+    auto& audio = Application::GetInstance().GetAudioService();
+    audio.SetExternalPlaybackActive(false);
+    // Do not EnableInput(false) here: a deferred StopStream join can run AFTER
+    // Chat already restored the mic, which would leave listening with no PCM.
+    ESP_LOGI(TAG, "audio exclusive OFF (models deferred) heap=%u largest=%u",
+             (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest());
 }
 
 void RadioPage::StreamTask(void* arg) {
     auto* self = static_cast<RadioPage*>(arg);
 
-    ESP_LOGI(TAG, "StreamTask start heap=%u stack=%d",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), kTaskStack);
+    self->stream_alive_.store(true);
+    ESP_LOGI(TAG, "StreamTask start heap=%u largest=%u stack=%d",
+             (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest(), kTaskStack);
+
+    auto finish = [self](const char* why) {
+        if (self->active_http_.load() != nullptr) {
+            self->active_http_.store(nullptr);
+        }
+        self->stream_alive_.store(false);
+        self->play_state_.store(RadioPlayState::Idle);
+        ESP_LOGI(TAG, "StreamTask finish (%s) heap=%u", why, (unsigned)InternalHeapFree());
+        xSemaphoreGive(self->stream_done_);
+        vTaskDelete(nullptr);
+    };
 
     static bool mp3_registered = false;
     if (!mp3_registered) {
@@ -776,8 +943,7 @@ void RadioPage::StreamTask(void* arg) {
                      (int)reg, (int)sup);
             self->play_state_.store(RadioPlayState::Error);
             self->SetStatusHint("no mp3 decoder");
-            xSemaphoreGive(self->stream_done_);
-            vTaskDelete(nullptr);
+            finish("no mp3");
             return;
         }
         mp3_registered = true;
@@ -793,15 +959,14 @@ void RadioPage::StreamTask(void* arg) {
     if (!OpenDecoder(&ctx)) {
         self->play_state_.store(RadioPlayState::Error);
         self->SetStatusHint("no memory for mp3");
-        xSemaphoreGive(self->stream_done_);
-        vTaskDelete(nullptr);
+        finish("decoder open fail");
         return;
     }
 
     ctx.pcm.resize(kPcmOutInit);
     ctx.resample.resize(kResampleChunk);
-    ESP_LOGI(TAG, "buffers ready, heap=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "buffers ready, heap=%u largest=%u", (unsigned)InternalHeapFree(),
+             (unsigned)InternalHeapLargest());
 
     PlayTestTone(kToneMs, kToneHz);
 
@@ -850,13 +1015,13 @@ void RadioPage::StreamTask(void* arg) {
 
     ESP_LOGI(TAG, "StreamTask exit pcm=%u bytes=%u stack_free=%u", (unsigned)ctx.pcm_chunks,
              (unsigned)ctx.bytes_in, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
-    self->play_state_.store(RadioPlayState::Idle);
-    xSemaphoreGive(self->stream_done_);
-    vTaskDelete(nullptr);
+    finish("normal exit");
 }
 
 void RadioPage::StartStream() {
-    if (stream_task_ != nullptr) {
+    if (!active_) {
+        ESP_LOGW(TAG, "StartStream skipped: page inactive heap=%u",
+                 (unsigned)InternalHeapFree());
         return;
     }
     if (stream_done_ == nullptr) {
@@ -868,19 +1033,54 @@ void RadioPage::StartStream() {
             return;
         }
     }
-    // Drop a token left behind by a join that timed out, so the next StopStream
-    // cannot return while this new task is still alive.
-    xSemaphoreTake(stream_done_, 0);
+
+    // A prior StopStream that timed out must be drained before we touch Opus/MP3
+    // again — otherwise two tasks share the codec and the heap is double-booked.
+    if (stream_alive_.load() || stream_task_ != nullptr) {
+        ESP_LOGW(TAG, "StartStream: prior task still alive=%d task=%p — draining",
+                 stream_alive_.load() ? 1 : 0, stream_task_);
+        stream_run_.store(false);
+        AbortActiveHttp();
+        if (!WaitStreamExit(pdMS_TO_TICKS(kStreamJoinMs), "before restart")) {
+            ESP_LOGE(TAG, "StartStream refuse: prior stream stuck heap=%u largest=%u",
+                     (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest());
+            play_state_.store(RadioPlayState::Error);
+            SetStatusHint("stream busy");
+            return;
+        }
+        stream_task_ = nullptr;
+    } else {
+        // Drop a token left behind by a join that timed out, so the next StopStream
+        // cannot return while this new task is still alive.
+        xSemaphoreTake(stream_done_, 0);
+    }
 
     // Take the codec here, on the main loop, before allocating the stack: tearing
     // down the wake-word/AFE pipeline releases a large block of internal SRAM, and
     // this board does not have enough free to carve out the task stack without it.
     // Capture/release now pair on the same thread (StartStream / StopStream).
-    ESP_LOGI(TAG, "heap before capture=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "heap before capture free=%u largest=%u exclusive=%d",
+             (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest(),
+             audio_exclusive_ ? 1 : 0);
     CaptureAudioExclusive();
-    ESP_LOGI(TAG, "heap after capture=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "heap after capture free=%u largest=%u", (unsigned)InternalHeapFree(),
+             (unsigned)InternalHeapLargest());
+
+    const size_t free_now = InternalHeapFree();
+    const size_t largest_now = InternalHeapLargest();
+    if (free_now < kMinHeapToStream) {
+        ESP_LOGE(TAG, "StartStream refuse: heap %u < %u after ReleaseAudioModels largest=%u",
+                 (unsigned)free_now, (unsigned)kMinHeapToStream, (unsigned)largest_now);
+        play_state_.store(RadioPlayState::Error);
+        SetStatusHint("low memory");
+        ReleaseAudioExclusive();
+        return;
+    }
+    if (largest_now < kWarnLargestToStream) {
+        ESP_LOGW(TAG,
+                 "StartStream: largest %u < %u (trying decoder anyway) heap=%u",
+                 (unsigned)largest_now, (unsigned)kWarnLargestToStream, (unsigned)free_now);
+    }
 
     stream_run_.store(true);
     user_paused_.store(false);
@@ -895,31 +1095,54 @@ void RadioPage::StartStream() {
     const BaseType_t ok = xTaskCreatePinnedToCore(StreamTask, "radio_stream", kTaskStack, this,
                                                   kTaskPrio, &stream_task_, kTaskCore);
     if (ok != pdPASS) {
-        ESP_LOGE(TAG, "stream task create failed heap=%u",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        ESP_LOGE(TAG, "stream task create failed heap=%u largest=%u",
+                 (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest());
         stream_run_.store(false);
         stream_task_ = nullptr;
+        stream_alive_.store(false);
         play_state_.store(RadioPlayState::Error);
         SetStatusHint("low memory");
         ReleaseAudioExclusive();
+    } else {
+        ESP_LOGI(TAG, "StartStream ok task=%p", stream_task_);
     }
 }
 
 void RadioPage::StopStream() {
-    if (stream_task_ == nullptr) {
+    stream_run_.store(false);
+    user_paused_.store(false);
+    AbortActiveHttp();
+
+    if (!stream_alive_.load() && stream_task_ == nullptr) {
         ReleaseAudioExclusive();
         return;
     }
-    ESP_LOGI(TAG, "StopStream begin");
-    stream_run_.store(false);
-    user_paused_.store(false);
 
-    // Bounded join. Reads use a 6s socket timeout and the decode loop checks
-    // stream_run_ every frame, so this normally returns in well under a second.
-    if (xSemaphoreTake(stream_done_, pdMS_TO_TICKS(4000)) != pdTRUE) {
-        // Never vTaskDelete() here: the task may be mid-syscall (or already gone),
-        // and killing it would leak its socket and leave driver mutexes locked.
-        ESP_LOGE(TAG, "stream task did not exit in 4s; leaving it to finish");
+    ESP_LOGI(TAG, "StopStream begin alive=%d task=%p heap=%u", stream_alive_.load() ? 1 : 0,
+             stream_task_, (unsigned)InternalHeapFree());
+
+    // Bounded join. AbortActiveHttp should unblock open/read within ms; the long
+    // ceiling only covers the rare case where close did not wake the caller.
+    if (!WaitStreamExit(pdMS_TO_TICKS(kStreamJoinMs), "StopStream")) {
+        // Do NOT null stream_task_ and do NOT Restore Opus: the zombie still holds
+        // the MP3 decoder (~25KB). Restoring Opus on top is what made re-enter fail
+        // with MEM_LACK / silent "connecting". StartStream will drain it next time.
+        ESP_LOGE(TAG, "StopStream: join timeout — keeping exclusive (no Opus restore yet)");
+        play_state_.store(RadioPlayState::Idle);
+        Application::GetInstance().Schedule([this]() {
+            if (stream_alive_.load() || stream_task_ != nullptr) {
+                AbortActiveHttp();
+                if (!WaitStreamExit(pdMS_TO_TICKS(kStreamJoinMs), "deferred leave")) {
+                    ESP_LOGE(TAG, "deferred leave still stuck");
+                    return;
+                }
+            }
+            stream_task_ = nullptr;
+            if (!active_) {
+                ReleaseAudioExclusive();
+            }
+        });
+        return;
     }
     stream_task_ = nullptr;
     play_state_.store(RadioPlayState::Idle);
@@ -929,8 +1152,8 @@ void RadioPage::StopStream() {
         band_levels_[i] = 0.0f;
     }
     ReleaseAudioExclusive();
-    ESP_LOGI(TAG, "StopStream end heap=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "StopStream end heap=%u largest=%u", (unsigned)InternalHeapFree(),
+             (unsigned)InternalHeapLargest());
 }
 
 void RadioPage::SelectStation(int index) {
@@ -1079,6 +1302,7 @@ void RadioPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     }
     display_ = display;
     active_ = true;
+    const uint32_t gen = enter_gen_.fetch_add(1) + 1;
     band_peak_ = 200.0f;
     for (int i = 0; i < kBarCount; ++i) {
         band_levels_[i] = 0.0f;
@@ -1086,14 +1310,20 @@ void RadioPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     if (station_index_.load() < 0 || station_index_.load() >= kStationCount) {
         station_index_.store(kDefaultStation);
     }
-    ESP_LOGI(TAG, "OnEnter station=%d (%s) heap=%u", station_index_.load(),
-             kStations[station_index_.load()].short_name,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "OnEnter gen=%u station=%d (%s) heap=%u largest=%u exclusive=%d alive=%d",
+             (unsigned)gen, station_index_.load(), kStations[station_index_.load()].short_name,
+             (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest(),
+             audio_exclusive_ ? 1 : 0, stream_alive_.load() ? 1 : 0);
+
+    // Free Opus before the 24-bar panel so the decoder later gets first pick of
+    // the hole ReleaseAudioModels just opened. StartStream re-asserts (idempotent).
+    CaptureAudioExclusive();
 
     BuildPanel(display);
     if (panel_ == nullptr) {
         ESP_LOGE(TAG, "BuildPanel failed");
         active_ = false;
+        ReleaseAudioExclusive();
         return;
     }
     {
@@ -1110,21 +1340,28 @@ void RadioPage::OnEnter(CardputerAdvCarLcdDisplay* display) {
     SetStatusHint("connecting");
     // Deferred so PageManager::ShowPage can clear switching_ first. Capturing `this`
     // is safe: RadioPage is a by-value member of PageManager and outlives the app.
-    Application::GetInstance().Schedule([this]() {
-        if (active_) {
-            StartStream();
+    // enter_gen_ invalidates a StartStream that was queued before a leave/re-enter.
+    Application::GetInstance().Schedule([this, gen]() {
+        if (!active_ || enter_gen_.load() != gen) {
+            ESP_LOGW(TAG, "StartStream schedule dropped gen=%u now=%u active=%d", (unsigned)gen,
+                     (unsigned)enter_gen_.load(), active_ ? 1 : 0);
+            return;
         }
+        StartStream();
     });
 }
 
 void RadioPage::OnLeave(CardputerAdvCarLcdDisplay* display) {
+    // Invalidate any pending StartStream before stopping, so a late Schedule cannot
+    // recreate the stream after we have released (or while we are releasing).
+    enter_gen_.fetch_add(1);
     active_ = false;
+    ESP_LOGI(TAG, "OnLeave gen=%u alive=%d exclusive=%d heap=%u largest=%u",
+             (unsigned)enter_gen_.load(), stream_alive_.load() ? 1 : 0, audio_exclusive_ ? 1 : 0,
+             (unsigned)InternalHeapFree(), (unsigned)InternalHeapLargest());
     StopStream();
-    if (display == nullptr || panel_ == nullptr) {
-        return;
-    }
-    DisplayLockGuard lock(display);
-    lv_obj_add_flag(panel_, LV_OBJ_FLAG_HIDDEN);
+    DestroyPanel(display);
+    // Never RestoreAudioModels here — Chat does that after ShowPage completes.
 }
 
 void RadioPage::Tick(CardputerAdvCarLcdDisplay* display) {

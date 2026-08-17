@@ -23,6 +23,9 @@ public:
     virtual void SetInputGain(float gain);
     virtual void EnableInput(bool enable);
     virtual void EnableOutput(bool enable);
+    // Close+reopen the codec device so RX DMA is fresh after TX-only playback
+    // (Radio writes PCM without reading the mic). Default cycles EnableInput/Output.
+    virtual void RecycleDevice();
 
     virtual void OutputData(std::vector<int16_t>& data);
     virtual bool InputData(std::vector<int16_t>& data);

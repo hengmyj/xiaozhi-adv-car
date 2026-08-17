@@ -134,14 +134,23 @@ public:
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
-    // Free wakenet/AFE memory so an exclusive-audio page can afford its decoder.
-    // Both are re-created on the next EnableWakeWordDetection/EnableVoiceProcessing.
+    // Free wakenet/AFE/Opus so an exclusive-audio page can afford its decoder.
+    // RestoreAudioModels is a no-op until ReleaseAudioModels has run (boot-safe).
     void ReleaseAudioModels();
     void RestoreAudioModels();
+    bool AudioModelsReleased() const { return models_released_; }
+    bool HasOpusEncoder() const { return opus_encoder_ != nullptr; }
+    bool HasOpusDecoder() const { return opus_decoder_ != nullptr; }
+    bool IsExternalPlaybackActive() const { return external_playback_active_; }
+    const DebugStatistics& GetDebugStatistics() const { return debug_statistics_; }
 
     // Direct codec playback (e.g. Radio HLS): hold ES8311 TX so power-save cannot mute.
     void SetExternalPlaybackActive(bool active);
     void NotifyOutputActivity();
+    // Music (and other direct InputData paths): keep last_input_time_ fresh so the
+    // audio-power timer does not EnableInput(false) mid-capture and reopen the
+    // duplex device (heap churn on no-PSRAM).
+    void NotifyInputActivity();
 
 private:
     AudioCodec* codec_ = nullptr;
@@ -185,6 +194,7 @@ private:
 
     bool wake_word_initialized_ = false;
     bool audio_processor_initialized_ = false;
+    bool models_released_ = false;
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;

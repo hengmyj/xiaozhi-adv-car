@@ -547,7 +547,7 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
 }
 
 void AudioService::EnableWakeWordDetection(bool enable) {
-    if (!wake_word_) {
+    if (!wake_word_ || codec_ == nullptr) {
         return;
     }
 
@@ -577,7 +577,20 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {
-    ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
+    if (audio_processor_ == nullptr || codec_ == nullptr) {
+        ESP_LOGW(TAG, "EnableVoiceProcessing(%d) skipped processor=%p codec=%p",
+                 enable ? 1 : 0, audio_processor_.get(), codec_);
+        return;
+    }
+    if (enable && (models_released_ || opus_encoder_ == nullptr)) {
+        ESP_LOGW(TAG, "EnableVoiceProcessing: opus missing released=%d enc=%p dec=%p — Restore first",
+                 models_released_ ? 1 : 0, opus_encoder_, opus_decoder_);
+        RestoreAudioModels();
+    }
+    ESP_LOGI(TAG, "%s voice processing init=%d running=%d enc=%p dec=%p in=%d",
+             enable ? "Enabling" : "Disabling", audio_processor_initialized_ ? 1 : 0,
+             IsAudioProcessorRunning() ? 1 : 0, opus_encoder_, opus_decoder_,
+             codec_->input_enabled() ? 1 : 0);
     if (enable) {
         if (!audio_processor_initialized_) {
             audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
@@ -609,55 +622,101 @@ void AudioService::ReleaseAudioModels() {
     // that RAM for their own decoder, so hand it back here. Both are lazily
     // re-Initialize()d by EnableWakeWordDetection/EnableVoiceProcessing.
     size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    if (wake_word_ != nullptr && wake_word_initialized_) {
+    size_t before_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const bool had_ww = wake_word_ != nullptr && wake_word_initialized_;
+    const bool had_ap = audio_processor_ != nullptr && audio_processor_initialized_;
+    const bool had_enc = opus_encoder_ != nullptr;
+    const bool had_dec = opus_decoder_ != nullptr;
+    if (had_ww) {
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
         wake_word_->Deinitialize();
         wake_word_initialized_ = false;
     }
-    if (audio_processor_ != nullptr && audio_processor_initialized_) {
+    if (had_ap) {
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
         audio_processor_->Deinitialize();
         audio_processor_initialized_ = false;
     }
-    // The Opus pair stays open for the whole app lifetime and is the single largest
-    // reclaimable block. An exclusive-audio page speaks to the codec directly and
-    // needs neither, so hand the memory over and rebuild them on the way out.
-    if (opus_encoder_ != nullptr) {
+    // Drop queued PCM/Opus payloads before closing codecs so their buffers return
+    // to the heap as one contiguous reclaim with the Opus pair.
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        timestamp_queue_.clear();
+        audio_encode_queue_.clear();
+        audio_decode_queue_.clear();
+        audio_playback_queue_.clear();
+        audio_testing_queue_.clear();
+        audio_send_queue_.clear();
+        audio_queue_cv_.notify_all();
+    }
+    // The Opus pair is the single largest reclaimable block. Exclusive pages talk
+    // to the codec directly and need neither; Chat rebuilds via RestoreAudioModels.
+    if (had_enc) {
         esp_opus_enc_close(opus_encoder_);
         opus_encoder_ = nullptr;
     }
-    if (opus_decoder_ != nullptr) {
+    if (had_dec) {
+        std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
         esp_opus_dec_close(opus_decoder_);
         opus_decoder_ = nullptr;
     }
-    ESP_LOGI(TAG, "released audio models: internal heap %u -> %u", (unsigned)before,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    models_released_ = true;
+    ESP_LOGI(TAG,
+             "released audio models: heap %u -> %u largest %u -> %u (ww=%d ap=%d enc=%d dec=%d)",
+             (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)before_largest,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), had_ww ? 1 : 0,
+             had_ap ? 1 : 0, had_enc ? 1 : 0, had_dec ? 1 : 0);
 }
 
 void AudioService::RestoreAudioModels() {
+    if (codec_ == nullptr) {
+        ESP_LOGW(TAG, "RestoreAudioModels skipped: codec not initialized");
+        return;
+    }
+    if (!models_released_) {
+        ESP_LOGD(TAG, "RestoreAudioModels skipped: models still resident");
+        return;
+    }
+    size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    bool dec_ok = opus_decoder_ != nullptr;
+    bool enc_ok = opus_encoder_ != nullptr;
     if (opus_decoder_ == nullptr) {
         esp_opus_dec_cfg_t cfg = OPUS_DEC_CFG(codec_->output_sample_rate(), OPUS_FRAME_DURATION_MS);
         if (esp_opus_dec_open(&cfg, sizeof(cfg), &opus_decoder_) != ESP_AUDIO_ERR_OK) {
-            ESP_LOGE(TAG, "failed to re-open opus decoder");
+            ESP_LOGE(TAG, "failed to re-open opus decoder (heap=%u largest=%u)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            dec_ok = false;
         } else {
             decoder_sample_rate_ = codec_->output_sample_rate();
             decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
             decoder_frame_size_ = decoder_sample_rate_ / 1000 * OPUS_FRAME_DURATION_MS;
+            dec_ok = true;
         }
     }
     if (opus_encoder_ == nullptr) {
         esp_opus_enc_config_t cfg = AS_OPUS_ENC_CONFIG();
         if (esp_opus_enc_open(&cfg, sizeof(cfg), &opus_encoder_) != ESP_AUDIO_ERR_OK) {
-            ESP_LOGE(TAG, "failed to re-open opus encoder");
+            ESP_LOGE(TAG, "failed to re-open opus encoder (heap=%u largest=%u)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            enc_ok = false;
         } else {
             encoder_sample_rate_ = 16000;
             encoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
             esp_opus_enc_get_frame_size(opus_encoder_, &encoder_frame_size_, &encoder_outbuf_size_);
             encoder_frame_size_ = encoder_frame_size_ / sizeof(int16_t);
+            enc_ok = true;
         }
     }
-    ESP_LOGI(TAG, "restored audio models, internal heap=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    if (enc_ok && dec_ok) {
+        models_released_ = false;
+    }
+    ESP_LOGI(TAG, "restored audio models enc=%p dec=%p enc_ok=%d dec_ok=%d released=%d heap %u -> %u largest=%u",
+             opus_encoder_, opus_decoder_, enc_ok ? 1 : 0, dec_ok ? 1 : 0, models_released_ ? 1 : 0,
+             (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 void AudioService::EnableAudioTesting(bool enable) {
@@ -755,6 +814,10 @@ void AudioService::SetExternalPlaybackActive(bool active) {
 
 void AudioService::NotifyOutputActivity() {
     last_output_time_ = std::chrono::steady_clock::now();
+}
+
+void AudioService::NotifyInputActivity() {
+    last_input_time_ = std::chrono::steady_clock::now();
 }
 
 void AudioService::CheckAndUpdateAudioPowerState() {

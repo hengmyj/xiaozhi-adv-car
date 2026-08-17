@@ -113,6 +113,21 @@ void CarPage::BuildSceneGraphic(lv_obj_t* parent) {
     lv_obj_set_pos(car_front_, kTruckX + 146, kTruckY + 20);
 }
 
+void CarPage::ResetSceneWidgets() {
+    cab_ = nullptr;
+    windshield_ = nullptr;
+    bed_ = nullptr;
+    bed_gate_ = nullptr;
+    car_front_ = nullptr;
+    for (int i = 0; i < kWheelCount; ++i) {
+        wheels_[i] = nullptr;
+        wheel_hubs_[i] = nullptr;
+        for (int s = 0; s < kSpokesPerWheel; ++s) {
+            wheel_spokes_[i][s] = nullptr;
+        }
+    }
+}
+
 void CarPage::UpdateSceneGraphic(int running) {
     if (cab_ == nullptr) {
         return;

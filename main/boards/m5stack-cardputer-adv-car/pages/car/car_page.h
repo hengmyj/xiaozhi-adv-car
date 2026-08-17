@@ -15,6 +15,7 @@ public:
 protected:
     void BuildSceneGraphic(lv_obj_t* parent) override;
     void UpdateSceneGraphic(int running) override;
+    void ResetSceneWidgets() override;
 
 private:
     static constexpr int kWheelCount = 2;

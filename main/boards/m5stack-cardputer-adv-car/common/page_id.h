@@ -12,4 +12,6 @@ enum class PageId : uint8_t {
     Matrix = 7,
     Music = 8,  // mic visualizer (was Cursor; real Cursor later)
     Radio = 9,  // CNR 央广 live stream
+    Snake = 10,
+    Dino = 11,
 };
