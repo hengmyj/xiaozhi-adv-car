@@ -177,6 +177,15 @@ git clone --depth 1 --branch v2.8.6 \
 
 ## 构建
 
+**预编译固件（v2.2.7）**：`firmware/m5stack-cardputer-adv-car/xiaozhi-adv-car-v2.2.7.bin`（整包，从 `0x0` 烧录；zip 同目录）。分区表变更后须整包刷，不能仅 OTA。
+
+```bash
+python -m esptool --chip esp32s3 -b 460800 -p PORT \
+  --before default_reset --after hard_reset \
+  write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m \
+  0x0 firmware/m5stack-cardputer-adv-car/xiaozhi-adv-car-v2.2.7.bin
+```
+
 **ESP-IDF 版本**：与上游 xiaozhi-esp32 2.2.x 相同，需 **5.4 或以上**（本机已验证 **v5.5.3**）。
 
 ```bash
