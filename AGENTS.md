@@ -28,3 +28,13 @@ Cardputer ADV 小智 fork + 多页启动器。
 - 勿设 `CONFIG_ESP_CONSOLE_NONE=y`：panic 无处输出，重启循环看不到 backtrace
 - 串口出现 `Device not configured` / reconnect 等待：USB CDC 常已断开，需拔插并确认 `/dev/cu.usbmodem*`；macOS Cmd+C 不会停 idf_monitor
 - 远程仓库：`https://github.com/hengmyj/xiaozhi-adv-car`
+
+## Cursor Cloud specific instructions
+
+- 这是 ESP-IDF 固件仓库，没有可交互运行的服务/网页。云端 VM 的「运行应用」= 完整编译目标板固件生成可烧录的 `xiaozhi.bin` / `merged-binary.bin`（CI 也只做编译，见 `.github/workflows/build.yml`）。VM 无实体硬件，`./flash.sh` / `./monitor.sh` 需要 `/dev/cu.usbmodem*` 串口，云端跑不了（会报「未找到 USB 串口」），只用于本地烧录。
+- 工具链：ESP-IDF **v5.5.3** 已装在 `~/.espressif/v5.5.3/esp-idf`（快照内），target 已装 `esp32s3`；这正是 `flash.sh` / `monitor.sh` 默认的 `IDF_PATH`。CI 用官方镜像 `espressif/idf:v5.5.2`，本仓库要求 ≥5.4，两者都能编。
+- 每个新 shell 先 source 环境再用 `idf.py`：`export IDF_PATH=$HOME/.espressif/v5.5.3/esp-idf && . $IDF_PATH/export.sh`。
+- 构建/验证板固件（与 CI 一致，含 set-target + 追加 sdkconfig + build + merge-bin + 打 zip 到 `releases/`）：`python scripts/release.py m5stack-cardputer-adv-car --name m5stack-cardputer-adv-car`。注意 `release.py` 若对应 `releases/v<ver>_<name>.zip` 已存在会跳过编译——重新验证前先删掉该 zip。
+- 只想快速编译不打包：source 环境后 `idf.py -DBOARD_NAME=m5stack-cardputer-adv-car -DBOARD_TYPE=m5stack-cardputer-adv-car build`（首次会拉 managed_components 并整编 ESP-IDF，随后增量很快）。
+- 尺寸/校验：`idf.py size`；`python3 -m esptool --chip esp32s3 image_info build/xiaozhi.bin`（Checksum/Validation Hash 为 valid 即镜像完好）。
+- ESP-IDF 的 Python venv 依赖系统包 `python3.12-venv`（已装在快照内）；如遇 `ensurepip is not available` 说明该系统包缺失，需 `sudo apt-get install -y python3.12-venv` 后再跑 `install.sh esp32s3`。
