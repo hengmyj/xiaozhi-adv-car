@@ -1,95 +1,24 @@
-name: Build Boards
+name: Release Cardputer ADV Car
 
 on:
   push:
     branches:
+      - master
       - main
-      - ci/* # for ci test
+    tags:
+      - "v*"
   pull_request:
     branches:
+      - master
       - main
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  prepare:
-    name: Determine variants to build
-    runs-on: ubuntu-latest
-    outputs:
-      variants: ${{ steps.select.outputs.variants }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - id: list
-        name: Get all variant list
-        run: |
-          echo "all_variants=$(python scripts/release.py --list-boards --json)" >> $GITHUB_OUTPUT
-
-      - id: select
-        name: Select variants based on changes
-        env:
-          ALL_VARIANTS: ${{ steps.list.outputs.all_variants }}
-        run: |
-          EVENT_NAME="${{ github.event_name }}"
-
-          # push 到 main 分支，编译全部变体
-          if [[ "$EVENT_NAME" == "push" ]]; then
-            echo "variants=$ALL_VARIANTS" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # pull_request 场景
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          echo "Base: $BASE_SHA, Head: $HEAD_SHA"
-
-          CHANGED=$(git diff --name-only $BASE_SHA $HEAD_SHA || true)
-          echo -e "Changed files:\n$CHANGED"
-
-          NEED_ALL=0
-          declare -A AFFECTED
-          while IFS= read -r file; do
-            if [[ "$file" == main/* && "$file" != main/boards/* ]]; then
-              NEED_ALL=1
-            fi
-
-            if [[ "$file" == main/boards/common/* ]]; then
-              NEED_ALL=1
-            fi
-
-            if [[ "$file" == main/boards/* ]]; then
-              board=$(echo "$file" | cut -d '/' -f3)
-              AFFECTED[$board]=1
-            fi
-          done <<< "$CHANGED"
-
-          if [[ "$NEED_ALL" -eq 1 ]]; then
-            echo "variants=$ALL_VARIANTS" >> $GITHUB_OUTPUT
-          else
-            if [[ ${#AFFECTED[@]} -eq 0 ]]; then
-              echo "variants=[]" >> $GITHUB_OUTPUT
-            else
-              BOARDS_JSON=$(printf '%s\n' "${!AFFECTED[@]}" | sort -u | jq -R -s -c 'split("\n")[:-1]')
-              FILTERED=$(echo "$ALL_VARIANTS" | jq -c --argjson boards "$BOARDS_JSON" 'map(select(.board as $b | $boards | index($b)))')
-              echo "variants=$FILTERED" >> $GITHUB_OUTPUT
-            fi
-          fi
-
   build:
-    name: Build ${{ matrix.full_name }}
-    needs: prepare
-    if: ${{ needs.prepare.outputs.variants != '[]' }}
-    strategy:
-      fail-fast: false  # 单个变体失败不影响其它变体
-      matrix:
-        include: ${{ fromJson(needs.prepare.outputs.variants) }}
+    name: Build m5stack-cardputer-adv-car
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.2
@@ -97,15 +26,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build current variant
+      - name: Build release firmware
         shell: bash
         run: |
           source $IDF_PATH/export.sh
-          python scripts/release.py ${{ matrix.board }} --name ${{ matrix.name }}
+          python scripts/release.py m5stack-cardputer-adv-car --name m5stack-cardputer-adv-car
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'from pathlib import Path
+for line in Path("CMakeLists.txt").read_text().splitlines():
+    if line.startswith("set(PROJECT_VER"):
+        print(line.split("\"")[1]); break')
+          echo "PROJECT_VER=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p dist
+          cp "build/xiaozhi-adv-car-v${VERSION}.bin" dist/
+          cp releases/v${VERSION}_m5stack-cardputer-adv-car.zip dist/
+          ls -lh dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xiaozhi_${{ matrix.full_name }}_${{ github.sha }}
-          path: build/merged-binary.bin
+          name: xiaozhi-adv-car-v${{ env.PROJECT_VER }}
+          path: dist/*
           if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            **xiaozhi-ADV-car v${{ env.PROJECT_VER }}** for M5Stack Cardputer ADV (ESP32-S3FN8, 8MB, no PSRAM).
+
+            Flash `xiaozhi-adv-car-v${{ env.PROJECT_VER }}.bin` at **0x0** (full image: bootloader + partition table + app + assets):
+
+            ```
+            esptool.py --chip esp32s3 -p PORT -b 460800 write_flash 0x0 xiaozhi-adv-car-v${{ env.PROJECT_VER }}.bin
+            ```
+
+            First flash must be a full write; do not OTA from the stock 8m partition table.

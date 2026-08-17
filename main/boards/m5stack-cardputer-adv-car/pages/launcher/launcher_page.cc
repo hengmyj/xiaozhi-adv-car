@@ -5,6 +5,7 @@
 
 #include <font_awesome.h>
 
+#include <esp_app_desc.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 
@@ -145,6 +146,7 @@ void LauncherPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     lv_obj_del(panel_);
     panel_ = nullptr;
     time_label_ = nullptr;
+    version_label_ = nullptr;
     for (int i = 0; i < kAppCount; ++i) {
         btns_[i] = nullptr;
     }
@@ -187,7 +189,16 @@ void LauncherPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     lv_label_set_text(wifi, FONT_AWESOME_WIFI);
     lv_obj_set_style_text_font(wifi, &BUILTIN_ICON_FONT, 0);
     lv_obj_set_style_text_color(wifi, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_align(wifi, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_align(wifi, LV_ALIGN_RIGHT_MID, -4, 0);
+
+    const esp_app_desc_t* app_desc = esp_app_get_description();
+    char ver[40];
+    std::snprintf(ver, sizeof(ver), "v%s", app_desc && app_desc->version[0] ? app_desc->version : "?");
+    version_label_ = lv_label_create(status);
+    lv_label_set_text(version_label_, ver);
+    lv_obj_set_style_text_font(version_label_, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(version_label_, lv_color_hex(0x888888), 0);
+    lv_obj_align_to(version_label_, wifi, LV_ALIGN_OUT_LEFT_MID, -4, 0);
 
     // ASCII titles avoid garbled CJK when glyph subset is incomplete.
     const int col2 = kGridX + kBtnW + kGapX;

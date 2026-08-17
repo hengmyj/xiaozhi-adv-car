@@ -46,16 +46,39 @@ def merge_bin() -> None:
 
 
 def zip_bin(name: str, version: str) -> None:
-    """Zip build/merged-binary.bin to releases/v{version}_{name}.zip"""
+    """Zip merged flash image + flash notes to releases/v{version}_{name}.zip"""
     out_dir = Path("releases")
     out_dir.mkdir(exist_ok=True)
     output_path = out_dir / f"v{version}_{name}.zip"
+    bin_name = f"xiaozhi-adv-car-v{version}.bin"
+    named_bin = Path("build") / bin_name
+    src_bin = Path("build/merged-binary.bin")
+    if not src_bin.exists():
+        print("merged-binary.bin not found", file=sys.stderr)
+        sys.exit(1)
+    named_bin.write_bytes(src_bin.read_bytes())
+
+    flash_txt = (
+        f"xiaozhi-ADV-car v{version}\n"
+        f"Board: M5Stack Cardputer ADV (ESP32-S3FN8, 8MB flash, no PSRAM)\n"
+        f"OTA name: {name}\n"
+        "\n"
+        "Flash the merged image at offset 0x0 (first-time / full flash):\n"
+        f"  esptool.py --chip esp32s3 -p PORT -b 460800 write_flash 0x0 {bin_name}\n"
+        "\n"
+        "Windows / Flash Download Tool: chip ESP32-S3, SPI SPEED 40MHz, SPI MODE DIO,\n"
+        f"  load {bin_name} at address 0x0, then Start.\n"
+        "\n"
+        "This image includes bootloader + partition table + firmware + assets.\n"
+        "Partition layout changed vs stock 8m.csv — do not OTA from older tables.\n"
+    )
 
     if output_path.exists():
         output_path.unlink()
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-        zipf.write("build/merged-binary.bin", arcname="merged-binary.bin")
+        zipf.write(named_bin, arcname=bin_name)
+        zipf.writestr("FLASH.txt", flash_txt)
     print(f"zip bin to {output_path} done")
 
 def _get_manufacturer(cfg: dict) -> Optional[str]:

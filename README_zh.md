@@ -130,7 +130,17 @@ v1 的稳定版本为 1.9.2，可以通过 `git checkout v1` 来切换到 v1 版
 
 ## xiaozhi-ADV-car Fork
 
-本仓库为 M5Stack Cardputer ADV 多页车控 fork，OTA 板名 `m5stack-cardputer-adv-car`。
+本仓库为 M5Stack Cardputer ADV 多页车控 fork，OTA 板名 `m5stack-cardputer-adv-car`，固件版本 **v2.2.6**。
+
+### 直接刷机（无需编译）
+
+从 [GitHub Releases](https://github.com/hengmyj/xiaozhi-adv-car/releases) 下载 `xiaozhi-adv-car-v2.2.6.bin`（或 zip 包），整包烧到 **0x0**：
+
+```bash
+esptool.py --chip esp32s3 -p PORT -b 460800 write_flash 0x0 xiaozhi-adv-car-v2.2.6.bin
+```
+
+Windows 也可用 Flash Download Tool：芯片 ESP32-S3，SPI 40MHz / DIO，地址 `0x0` 加载该 bin。分区表相对官方 `8m.csv` 有变，**首次必须整包刷**，不能只 OTA。启动器顶栏右侧会显示 `v2.2.6`。
 
 ### MQTT 车控（摘要）
 
