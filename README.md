@@ -173,4 +173,4 @@ If you have any ideas or suggestions, please feel free to raise Issues or join o
 </a>
 ## xiaozhi-ADV-car Fork
 
-本仓库为 M5Stack Cardputer ADV 多页车控 fork，OTA 板名 `m5stack-cardputer-adv-car`，固件版本 **v2.2.6**。预编译 bin 见 [Releases](https://github.com/hengmyj/xiaozhi-adv-car/releases)，整包刷 `0x0`：`esptool.py --chip esp32s3 -p PORT write_flash 0x0 xiaozhi-adv-car-v2.2.6.bin`。详见 `main/boards/m5stack-cardputer-adv-car/README_zh.md` 与 `PLAN.md`。
+本仓库为 M5Stack Cardputer ADV 多页车控 fork，OTA 板名 `m5stack-cardputer-adv-car`，固件版本 **v2.2.6**。预编译整包 bin：[`firmware/xiaozhi-adv-car-v2.2.6.bin`](firmware/xiaozhi-adv-car-v2.2.6.bin)，刷 `0x0`：`esptool.py --chip esp32s3 -p PORT write_flash 0x0 xiaozhi-adv-car-v2.2.6.bin`。详见 `main/boards/m5stack-cardputer-adv-car/README_zh.md` 与 `PLAN.md`。

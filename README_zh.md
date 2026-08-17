@@ -134,7 +134,7 @@ v1 的稳定版本为 1.9.2，可以通过 `git checkout v1` 来切换到 v1 版
 
 ### 直接刷机（无需编译）
 
-从 [GitHub Releases](https://github.com/hengmyj/xiaozhi-adv-car/releases) 下载 `xiaozhi-adv-car-v2.2.6.bin`（或 zip 包），整包烧到 **0x0**：
+下载 [`firmware/xiaozhi-adv-car-v2.2.6.bin`](firmware/xiaozhi-adv-car-v2.2.6.bin)（或 [GitHub Releases](https://github.com/hengmyj/xiaozhi-adv-car/releases)），整包烧到 **0x0**：
 
 ```bash
 esptool.py --chip esp32s3 -p PORT -b 460800 write_flash 0x0 xiaozhi-adv-car-v2.2.6.bin

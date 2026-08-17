@@ -1,0 +1,12 @@
+xiaozhi-ADV-car v2.2.6
+Board: M5Stack Cardputer ADV (ESP32-S3FN8, 8MB flash, no PSRAM)
+OTA name: m5stack-cardputer-adv-car
+
+Flash the merged image at offset 0x0 (first-time / full flash):
+  esptool.py --chip esp32s3 -p PORT -b 460800 write_flash 0x0 xiaozhi-adv-car-v2.2.6.bin
+
+Windows / Flash Download Tool: chip ESP32-S3, SPI SPEED 40MHz, SPI MODE DIO,
+  load xiaozhi-adv-car-v2.2.6.bin at address 0x0, then Start.
+
+This image includes bootloader + partition table + firmware + assets.
+Partition layout changed vs stock 8m.csv — do not OTA from older tables.

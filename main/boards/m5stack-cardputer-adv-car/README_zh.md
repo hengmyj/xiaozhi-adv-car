@@ -205,7 +205,7 @@ PORT=/dev/cu.usbmodem101 ./flash.sh
 
 ### 预编译 Release（无需搭建 IDF）
 
-固件版本 **v2.2.6**（`CMakeLists.txt` 的 `PROJECT_VER`，启动器顶栏右侧也会显示）。从仓库 [Releases](https://github.com/hengmyj/xiaozhi-adv-car/releases) 下载 `xiaozhi-adv-car-v2.2.6.bin`，整包写到 **0x0**：
+固件版本 **v2.2.6**（`CMakeLists.txt` 的 `PROJECT_VER`，启动器顶栏右侧也会显示）。下载仓库内 [`firmware/xiaozhi-adv-car-v2.2.6.bin`](../../../firmware/xiaozhi-adv-car-v2.2.6.bin)（或 [Releases](https://github.com/hengmyj/xiaozhi-adv-car/releases)），整包写到 **0x0**：
 
 ```bash
 esptool.py --chip esp32s3 -p PORT -b 460800 write_flash 0x0 xiaozhi-adv-car-v2.2.6.bin
