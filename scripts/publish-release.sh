@@ -9,24 +9,19 @@ if [[ -z "$VER" ]]; then
   echo "用法: $0 <版本号，如 v2.2.7>"
   exit 1
 fi
-VER_NUM="${VER#v}"
 BIN="firmware/m5stack-cardputer-adv-car/xiaozhi-adv-car-${VER}.bin"
 ZIP="firmware/m5stack-cardputer-adv-car/xiaozhi-adv-car-${VER}.zip"
+NOTES="firmware/m5stack-cardputer-adv-car/RELEASE_${VER}.md"
 [[ -f "$BIN" ]] || { echo "缺少 $BIN"; exit 1; }
+if [[ ! -f "$NOTES" ]]; then
+  echo "缺少 Release 说明 $NOTES"
+  exit 1
+fi
 
 gh auth status
 gh release delete "$VER" -y 2>/dev/null || true
 gh release create "$VER" \
   --title "${VER} - M5Stack Cardputer ADV Car" \
-  --notes "## M5Stack Cardputer ADV Car
-
-板型: \`m5stack-cardputer-adv-car\` | Flash 8MB | ESP32-S3
-
-\`\`\`bash
-python -m esptool --chip esp32s3 -b 460800 -p PORT \\
-  --before default_reset --after hard_reset \\
-  write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m \\
-  0x0 xiaozhi-adv-car-${VER}.bin
-\`\`\`" \
+  --notes-file "$NOTES" \
   "$BIN" "$ZIP"
 echo "OK: https://github.com/hengmyj/xiaozhi-adv-car/releases/tag/${VER}"

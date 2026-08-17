@@ -177,7 +177,9 @@ git clone --depth 1 --branch v2.8.6 \
 
 ## 构建
 
-**预编译固件（v2.2.7）**：`firmware/m5stack-cardputer-adv-car/xiaozhi-adv-car-v2.2.7.bin`（整包，从 `0x0` 烧录；zip 同目录）。分区表变更后须整包刷，不能仅 OTA。
+**预编译固件（v2.2.7）**：见 [firmware/m5stack-cardputer-adv-car/RELEASE_v2.2.7.md](firmware/m5stack-cardputer-adv-car/RELEASE_v2.2.7.md)（烧录说明 + 按键用法）。GitHub Release：[v2.2.7](https://github.com/hengmyj/xiaozhi-adv-car/releases/tag/v2.2.7)
+
+- `xiaozhi-adv-car-v2.2.7.bin` — 整包，从 `0x0` 烧录
 
 ```bash
 python -m esptool --chip esp32s3 -b 460800 -p PORT \
