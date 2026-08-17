@@ -25,7 +25,7 @@ private:
     enum class Phase : uint8_t { Ready, Running, Paused, Dead };
 
     static constexpr lv_coord_t kGroundY = 118;   // ground line Y
-    static constexpr lv_coord_t kDinoX = 24;      // dino left edge
+    static constexpr lv_coord_t kDinoX = 34;      // dino left edge (a bit back from screen edge)
     static constexpr int kMaxTree = 4;
     static constexpr int64_t kFrameUs = 16000;    // ~62.5 fps logic tick
 
@@ -38,6 +38,7 @@ private:
     void DrawScene();
     void UpdateHud();
     void Beep(int ms, int hz, int amp = 6000);
+    void UpdateBird();
     void StartMusic();
     void StopMusic();
     static void MusicTask(void* arg);
@@ -52,8 +53,13 @@ private:
 
     lv_obj_t* panel_ = nullptr;
     lv_obj_t* hud_ = nullptr;
+    lv_obj_t* timer_label_ = nullptr;
     lv_obj_t* speed_label_ = nullptr;
     lv_obj_t* ground_ = nullptr;
+    lv_obj_t* sun_ = nullptr;
+    lv_obj_t* sun_ray_[4] = {};
+    lv_obj_t* bird_ = nullptr;
+    lv_obj_t* icon_ = nullptr;  // kid-face logo, shown in Ready/Dead
     lv_obj_t* dino_body_ = nullptr;
     lv_obj_t* dino_head_ = nullptr;
     lv_obj_t* dino_eye_ = nullptr;
@@ -65,6 +71,8 @@ private:
     Phase phase_ = Phase::Ready;
     uint32_t score_ = 0;
     int64_t last_frame_us_ = 0;
+    int64_t run_start_us_ = 0;   // timer start (Running begin)
+    uint32_t timer_secs_ = 0;
 
     // Dino physics (pixels per frame at kFrameUs)
     float dino_y_ = 0;        // offset above ground (0 = running on ground)
@@ -78,4 +86,10 @@ private:
     lv_coord_t tree_x_[kMaxTree] = {240, 240, 240, 240};
     int16_t next_gap_ = 90;   // frames until next spawn
     uint8_t run_phase_ = 0;   // leg animation
+
+    // Sun + bird ambience
+    uint32_t tick_count_ = 0;             // frame counter (all phases)
+    lv_coord_t bird_x_ = 240;             // 240 = idle
+    int16_t bird_timer_ = 300;            // frames until next bird pass
+    uint8_t bird_flap_ = 0;               // wing animation phase
 };

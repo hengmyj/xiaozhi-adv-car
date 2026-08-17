@@ -35,6 +35,11 @@ bool ShouldReleaseResidentUi(PageId from, PageId to) {
     if (IsDashboardPage(from) && IsDashboardPage(to)) {
         return false;
     }
+    // Drop the hidden Launcher (46 objs, ~10KB) when entering the memory-hungry
+    // games — no-PSRAM heap was ~11KB with it resident, too low for image draws.
+    if (from == PageId::Launcher && (to == PageId::Snake || to == PageId::Dino)) {
+        return true;
+    }
     return from == PageId::Car || from == PageId::Spider || from == PageId::MjAc ||
            from == PageId::Clock || from == PageId::Matrix || from == PageId::Snake ||
            from == PageId::Dino;

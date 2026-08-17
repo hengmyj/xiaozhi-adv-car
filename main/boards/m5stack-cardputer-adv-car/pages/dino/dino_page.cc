@@ -4,6 +4,7 @@
 #include "board.h"
 #include "cardputer_adv_lcd_display.h"
 #include "display/display.h"
+#include "kid_face_icon.h"
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -36,6 +37,18 @@ constexpr uint32_t kHexCrown = 0x33CC55;
 constexpr uint32_t kHexTrunk = 0x8B5A2B;
 constexpr uint32_t kHexGround = 0x777777;
 constexpr uint32_t kHexHud = 0x00FF66;
+constexpr uint32_t kHexSun = 0xFFCC33;
+constexpr uint32_t kHexSunRay = 0xFFAA22;
+constexpr uint32_t kHexBird = 0xDDDDDD;
+
+// Sun top-left corner + float range
+constexpr lv_coord_t kSunX = 199;
+constexpr lv_coord_t kSunBaseY = 26;
+constexpr lv_coord_t kBirdY = 45;  // sky lane below the sun
+
+// Seagull outline, two wing poses (flap animation).
+const lv_point_precise_t kBirdUp[] = {{0, 0}, {5, 7}, {10, 0}};
+const lv_point_precise_t kBirdDown[] = {{0, 7}, {5, 0}, {10, 7}};
 
 constexpr lv_coord_t kDinoW = 20;   // body+head bounding width
 constexpr lv_coord_t kDinoH = 16;   // body height (head sticks up)
@@ -85,8 +98,13 @@ void DinoPage::DestroyPanel(CardputerAdvCarLcdDisplay* display) {
     }
     panel_ = nullptr;
     hud_ = nullptr;
+    timer_label_ = nullptr;
     speed_label_ = nullptr;
     ground_ = nullptr;
+    sun_ = nullptr;
+    std::memset(sun_ray_, 0, sizeof(sun_ray_));
+    bird_ = nullptr;
+    icon_ = nullptr;
     dino_body_ = nullptr;
     dino_head_ = nullptr;
     dino_eye_ = nullptr;
@@ -153,6 +171,16 @@ void DinoPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     lv_obj_set_style_pad_ver(hud_, 1, 0);
     lv_obj_align(hud_, LV_ALIGN_TOP_LEFT, 2, 2);
 
+    timer_label_ = lv_label_create(panel_);
+    lv_label_set_text(timer_label_, "00:00");
+    lv_obj_set_style_text_font(timer_label_, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(timer_label_, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(timer_label_, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(timer_label_, LV_OPA_80, 0);
+    lv_obj_set_style_pad_hor(timer_label_, 6, 0);
+    lv_obj_set_style_pad_ver(timer_label_, 1, 0);
+    lv_obj_align(timer_label_, LV_ALIGN_TOP_MID, 0, 2);
+
     speed_label_ = lv_label_create(panel_);
     lv_label_set_text(speed_label_, "SPD 3.2");
     lv_obj_set_style_text_font(speed_label_, &lv_font_montserrat_14, 0);
@@ -162,6 +190,35 @@ void DinoPage::BuildPanel(CardputerAdvCarLcdDisplay* display) {
     lv_obj_set_style_pad_hor(speed_label_, 4, 0);
     lv_obj_set_style_pad_ver(speed_label_, 1, 0);
     lv_obj_align(speed_label_, LV_ALIGN_TOP_RIGHT, -4, 2);
+
+    // Sun with four rays, floating in the sky below the speed label.
+    sun_ = lv_obj_create(panel_);
+    StripStyles(sun_);
+    lv_obj_set_size(sun_, 12, 12);
+    lv_obj_set_style_radius(sun_, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(sun_, lv_color_hex(kHexSun), 0);
+    lv_obj_set_style_bg_opa(sun_, LV_OPA_COVER, 0);
+    for (int i = 0; i < 4; ++i) {
+        sun_ray_[i] = lv_obj_create(panel_);
+        StyleRect(sun_ray_[i], kHexSunRay, 3, 3);
+    }
+
+    // Seagull (two-stroke outline), hidden until it flies by.
+    bird_ = lv_line_create(panel_);
+    lv_obj_set_style_line_width(bird_, 2, 0);
+    lv_obj_set_style_line_color(bird_, lv_color_hex(kHexBird), 0);
+    lv_obj_set_style_line_rounded(bird_, true, 0);
+    lv_line_set_points(bird_, kBirdUp, 3);
+    lv_obj_add_flag(bird_, LV_OBJ_FLAG_HIDDEN);
+
+    // Kid-face logo (120x90 full-color RGB565 from rr.png) — shown in Ready/Dead.
+    // Data lives in flash (kKidFaceIcon in kid_face_icon.h); lv_image_set_src() renders it
+    // directly as RGB565 pixels — no runtime decode, no RAM buffer needed.
+    icon_ = lv_image_create(panel_);
+    lv_image_set_src(icon_, &kKidFaceIcon);
+    lv_img_set_zoom(icon_, 256);  // 1x -> 120x90 (1:1, crisp)
+    lv_obj_align(icon_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(icon_, LV_OBJ_FLAG_HIDDEN);
 
     ESP_LOGI(TAG, "BuildPanel dino heap=%u largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -179,6 +236,9 @@ void DinoPage::ResetGame() {
     for (int i = 0; i < kMaxTree; ++i) {
         tree_x_[i] = kScreenW;
     }
+    bird_x_ = 240;
+    bird_timer_ = static_cast<int16_t>(50 + (esp_random() % 100));  // 5-15s
+    bird_flap_ = 0;
     phase_ = Phase::Ready;
     last_frame_us_ = 0;
 }
@@ -186,6 +246,8 @@ void DinoPage::ResetGame() {
 void DinoPage::StartRun() {
     phase_ = Phase::Running;
     last_frame_us_ = 0;
+    run_start_us_ = esp_timer_get_time();
+    timer_secs_ = 0;
 }
 
 void DinoPage::SpawnTree() {
@@ -227,6 +289,8 @@ void DinoPage::StepFrame() {
         }
     }
 
+    // Bird is updated in Tick() (all phases) — see UpdateBird.
+
     // Dino jump physics.
     if (jumping_) {
         dino_vy_ += 0.45f;  // gravity
@@ -265,6 +329,24 @@ void DinoPage::StepFrame() {
     speed_ = 3.2f + static_cast<float>(score_) * 0.0025f;
     if (speed_ > 8.0f) {
         speed_ = 8.0f;
+    }
+}
+
+void DinoPage::UpdateBird() {
+    // Runs on every Tick (Ready/Paused too, so the sky is alive).
+    const float bird_speed = (phase_ == Phase::Running) ? speed_ : 3.2f;
+    if (bird_x_ == kScreenW) {  // idle marker exactly at right edge
+        if (--bird_timer_ <= 0) {
+            bird_x_ = kScreenW - 1;  // enter flying lane next frame (not idle)
+            bird_timer_ = static_cast<int16_t>(50 + (esp_random() % 100));  // 5-15s
+        }
+    } else {
+        bird_x_ -= static_cast<lv_coord_t>(bird_speed * 1.6f);  // 1.6x tree speed
+        ++bird_flap_;
+        if (bird_x_ + 24 < 0) {
+            bird_x_ = kScreenW;
+            bird_timer_ = static_cast<int16_t>(50 + (esp_random() % 100));  // 5-15s
+        }
     }
 }
 
@@ -391,6 +473,24 @@ void DinoPage::DrawScene() {
         lv_obj_clear_flag(line, LV_OBJ_FLAG_HIDDEN);
     }
 
+    // Sun floats gently (1px bob).
+    const lv_coord_t sun_y = kSunBaseY + ((tick_count_ / 10) % 2 ? 1 : 0);
+    lv_obj_set_pos(sun_, kSunX, sun_y);
+    constexpr lv_coord_t kRayOff = 7;
+    lv_obj_set_pos(sun_ray_[0], kSunX - kRayOff, sun_y - kRayOff);
+    lv_obj_set_pos(sun_ray_[1], kSunX + 12, sun_y - kRayOff);
+    lv_obj_set_pos(sun_ray_[2], kSunX - kRayOff, sun_y + 12);
+    lv_obj_set_pos(sun_ray_[3], kSunX + 12, sun_y + 12);
+
+    // Bird: two-stroke seagull, wings flapping, fast across the sky.
+    if (bird_x_ >= kScreenW) {
+        lv_obj_add_flag(bird_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_set_pos(bird_, bird_x_, kBirdY);
+        lv_line_set_points(bird_, (bird_flap_ / 6) % 2 ? kBirdDown : kBirdUp, 3);
+        lv_obj_clear_flag(bird_, LV_OBJ_FLAG_HIDDEN);
+    }
+
     // No full-panel invalidate: every set_pos/set_size above already invalidates
     // its own region. Full-panel invalidate forces a ~13ms 240x135 redraw per
     // frame, keeps the LVGL mutex busy, and made the esp_timer Tick lock time
@@ -419,11 +519,35 @@ void DinoPage::UpdateHud() {
     lv_label_set_text(hud_, buf);
     lv_obj_move_foreground(hud_);
 
+    // Elapsed timer (freezes on pause/death, resets on each StartRun).
+    if (phase_ == Phase::Running) {
+        timer_secs_ = static_cast<uint32_t>((esp_timer_get_time() - run_start_us_) / 1000000);
+    }
+    if (timer_label_ != nullptr) {
+        char tbuf[16];
+        std::snprintf(tbuf, sizeof(tbuf), "%02u:%02u",
+                      static_cast<unsigned>((timer_secs_ / 60) % 100),
+                      static_cast<unsigned>(timer_secs_ % 60));
+        lv_label_set_text(timer_label_, tbuf);
+        lv_obj_move_foreground(timer_label_);
+    }
+
     if (speed_label_ != nullptr) {
         char sbuf[16];
         std::snprintf(sbuf, sizeof(sbuf), "SPD %.1f", speed_);
         lv_label_set_text(speed_label_, sbuf);
         lv_obj_move_foreground(speed_label_);
+    }
+
+    // Kid-face logo: standby & game-over screen, hidden mid-run.
+    if (icon_ != nullptr) {
+        if (phase_ == Phase::Ready || phase_ == Phase::Dead) {
+            lv_obj_clear_flag(icon_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(icon_);
+            lv_obj_invalidate(icon_);
+        } else {
+            lv_obj_add_flag(icon_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -477,6 +601,7 @@ void DinoPage::Tick(CardputerAdvCarLcdDisplay* display) {
     if (!active_ || panel_ == nullptr || display == nullptr || stepping_) {
         return;
     }
+    ++tick_count_;
     const int64_t now = esp_timer_get_time();
     if (last_frame_us_ != 0 && (now - last_frame_us_) < kFrameUs) {
         return;
@@ -484,6 +609,7 @@ void DinoPage::Tick(CardputerAdvCarLcdDisplay* display) {
     last_frame_us_ = now;
     stepping_ = true;
     StepFrame();
+    UpdateBird();
     {
         DisplayLockGuard lock(display);
         DrawScene();

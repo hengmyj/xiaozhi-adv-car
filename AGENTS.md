@@ -2,7 +2,7 @@
 
 Cardputer ADV 小智 fork + 多页启动器。
 
-**文档索引**：[docs/README.md](docs/README.md)
+**文档索引**：[docs/README.md](docs/README.md) · 板级（页面/架构/加图）：[main/boards/m5stack-cardputer-adv-car/docs/README.md](main/boards/m5stack-cardputer-adv-car/docs/README.md)
 
 ## Learned User Preferences
 
@@ -16,7 +16,8 @@ Cardputer ADV 小智 fork + 多页启动器。
 ## Learned Workspace Facts
 
 - 硬件：Cardputer ADV（S3FN8、8MB、无 PSRAM）；板型/OTA `m5stack-cardputer-adv-car`
-- 页面与按键：[docs/architecture/pages-and-keys.md](docs/architecture/pages-and-keys.md)；MQTT：[docs/mqtt/car-mqtt-control.md](docs/mqtt/car-mqtt-control.md)
+- 页面介绍与操作：[main/boards/m5stack-cardputer-adv-car/docs/pages.md](main/boards/m5stack-cardputer-adv-car/docs/pages.md)；架构与切页内存：[architecture.md](main/boards/m5stack-cardputer-adv-car/docs/architecture.md)；按键速查：[docs/architecture/pages-and-keys.md](docs/architecture/pages-and-keys.md)；MQTT：[docs/mqtt/car-mqtt-control.md](docs/mqtt/car-mqtt-control.md)
+- 加图：编译期 PNG/SVG → RGB565 头文件 + `lv_image_set_src`（flash 直读）。禁止运行时 LODEPNG（ARGB8888 要约 19KB 连续堆，本板最大连续块 ~18KB）。源图先预览白像素占比，白填充截图会显示成「空图/占位符」。做法见 [docs/images.md](main/boards/m5stack-cardputer-adv-car/docs/images.md)。Dino logo 现为 `rr.png` 缩到 120×90 RGB565，`kid_face_icon.h`
 - 键盘配网：`wifi_config_ui` 用 overlay，禁止 `lv_obj_clean(lv_scr_act())`；W/S 等重操作经 `Application::Schedule` 到主任务，否则易重启
 - Radio：OnEnter 勿阻塞开流（`Schedule StartStream`）；进页先 `CaptureAudioExclusive` 再 BuildPanel；离页 StopStream + **DestroyPanel**（24 柱不可 hidden 常驻）。进 Radio 前 PageManager **sweep Destroy 所有其他独占页（含 Launcher）**，只留 Chat+Radio。`largest < 20KB` 只告警，以 decoder `MEM_LACK` 为准。离独占页勿立刻 `RestoreAudioModels`（Fn+1 进 Chat 且 `ShowPage` 完成后再 `ScheduleChatAudioRestore`：仅曾经 `ReleaseAudioModels` 才 `RecycleDevice` + 成对重建 encoder+decoder；开机 / 未 Release 跳过，勿对刚 Initialize 的 codec close+I2S-disable）；开机 `PageManager::Initialize` 只 `ShowChatUi`，勿走 Chat `OnEnter`（此时 `AudioService::codec_` 仍为空）。无 PSRAM 下只走 HTTP MP3 低码率。Radio↔Car/Music 二次无声见 [docs/audio/radio.md](docs/audio/radio.md)。Music Leave 须关麦、释放 mic_buf_ 并 DestroyPanel；**Car/Spider/IceBox 离页去 Launcher/Chat/Radio 时 ReleaseResidentUi（Destroy 仪表盘）**，Clock/Matrix Leave 一律 DestroyPanel（canvas 是 BSS，Destroy 只放 LVGL 对象）；Car/Spider/IceBox 互切仍复用 panel，避免 IceBox→Car 卡死。勿在 esp_timer Tick 里并发 close codec
 - 音频内存（无 PSRAM）：进 Radio 仅剩 27KB → MP3 解码器 `MEM_LACK`；`AudioService` 常驻 Opus 占 43KB，`ReleaseAudioModels()` 后回到 70KB。本板 `CONFIG_WAKE_WORD_DISABLED=y` 无 AFE，释放唤醒词模型无效
