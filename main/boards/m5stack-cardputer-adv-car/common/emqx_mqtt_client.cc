@@ -3,11 +3,18 @@
 #include "system_info.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <wifi_manager.h>
 
 #include <cstdio>
 
 #define TAG "EmqxCarMqtt"
+
+namespace {
+constexpr uint32_t kWorkerStack = 4096;
+constexpr UBaseType_t kWorkerPrio = 3;
+constexpr BaseType_t kWorkerCore = 0;
+}  // namespace
 
 void EmqxCarMqtt::Initialize(NetworkInterface* network) {
     network_ = network;
@@ -49,6 +56,52 @@ void EmqxCarMqtt::Initialize(NetworkInterface* network) {
     mqtt_->OnMessage([this](const std::string& topic, const std::string& payload) {
         OnMessage(topic, payload);
     });
+
+    // EspMqtt::Connect waits up to 10s (xEventGroupWaitBits). Never do that on
+    // ESP_TIMER_TASK: OnCarTimer also drives page Tick / LVGL. Worker on core 0
+    // matches Radio (taskLVGL is core 1). Do not Application::Schedule this:
+    // Connect on the main loop would stall ShowPage(Car/Spider).
+    const BaseType_t ok =
+        xTaskCreatePinnedToCore(&EmqxCarMqtt::WorkerTask, "emqx_mqtt", kWorkerStack, this,
+                                kWorkerPrio, &worker_handle_, kWorkerCore);
+    if (ok != pdPASS) {
+        worker_handle_ = nullptr;
+        ESP_LOGE(TAG, "Failed to create EMQX worker; car MQTT will stay offline");
+    }
+}
+
+void EmqxCarMqtt::RequestWorker(bool disconnect) {
+    if (worker_handle_ == nullptr) {
+        return;
+    }
+    if (worker_busy_.exchange(true)) {
+        return;
+    }
+    worker_disconnect_.store(disconnect);
+    xTaskNotifyGive(worker_handle_);
+}
+
+void EmqxCarMqtt::WorkerTask(void* arg) {
+    auto* self = static_cast<EmqxCarMqtt*>(arg);
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const bool disconnect = self->worker_disconnect_.load();
+        const int64_t t0 = esp_timer_get_time();
+        if (disconnect) {
+            if (self->mqtt_ != nullptr) {
+                self->mqtt_->Disconnect();
+            }
+            self->connected_ = false;
+            ESP_LOGI(TAG, "worker disconnect dt_us=%lld",
+                     static_cast<long long>(esp_timer_get_time() - t0));
+        } else {
+            self->TryConnect();
+            ESP_LOGI(TAG, "worker connect done connected=%d dt_us=%lld",
+                     self->connected_ ? 1 : 0,
+                     static_cast<long long>(esp_timer_get_time() - t0));
+        }
+        self->worker_busy_.store(false);
+    }
 }
 
 void EmqxCarMqtt::Tick() {
@@ -57,9 +110,8 @@ void EmqxCarMqtt::Tick() {
     }
 
     if (!WifiManager::GetInstance().IsConnected()) {
-        if (connected_) {
-            mqtt_->Disconnect();
-            connected_ = false;
+        if (connected_ || mqtt_->IsConnected()) {
+            RequestWorker(true);
         }
         return;
     }
@@ -74,7 +126,7 @@ void EmqxCarMqtt::Tick() {
         return;
     }
     last_reconnect_us_ = now;
-    TryConnect();
+    RequestWorker(false);
 }
 
 void EmqxCarMqtt::TryConnect() {

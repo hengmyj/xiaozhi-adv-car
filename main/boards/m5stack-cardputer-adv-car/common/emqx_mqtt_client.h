@@ -6,8 +6,12 @@
 #include <mqtt.h>
 #include <network_interface.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 class EmqxCarMqtt {
 public:
@@ -29,6 +33,8 @@ public:
 private:
     void TryConnect();
     void OnMessage(const std::string& topic, const std::string& payload);
+    void RequestWorker(bool disconnect);
+    static void WorkerTask(void* arg);
 
     NetworkInterface* network_ = nullptr;
     std::unique_ptr<Mqtt> mqtt_;
@@ -39,4 +45,7 @@ private:
     int speed_ = EMQX_DEFAULT_SPEED;
     int local_run_ = 0;
     int local_dir_ = 0;
+    std::atomic<bool> worker_busy_{false};
+    std::atomic<bool> worker_disconnect_{false};
+    TaskHandle_t worker_handle_ = nullptr;
 };
