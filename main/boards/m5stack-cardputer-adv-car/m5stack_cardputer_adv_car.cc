@@ -44,6 +44,8 @@ private:
 
     static void OnCarTimer(void* arg) {
         auto* board = static_cast<M5StackCardputerAdvCarBoard*>(arg);
+        // MQTT Tick must stay non-blocking: EspMqtt::Connect waits up to 10s and
+        // now runs on emqx_mqtt worker, not this ESP_TIMER_TASK.
         board->emqx_mqtt_.Tick();
         board->page_manager_.Tick();
     }
